@@ -42,7 +42,7 @@ func (c *client) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 
 func (c *client) read() {
 	c.lastHeartbeat = time.Now() // Initialize heartbeat time on read start
-	ctx := context.TODO()        // Use a proper context
+	// ctx := context.TODO() // Removed unused variable
 
 	for {
 		_, m, err := c.conn.ReadMessage()
@@ -74,6 +74,10 @@ func (c *client) read() {
 
 		// Periodic heartbeat update to Redis/DragonflyDB
 		if time.Since(c.lastHeartbeat) > heartbeatInterval || roleUpdated {
+			// Correctly access redisConfig from WsServer
+			ctxHeartbeat, cancelHB := context.WithTimeout(c.ws.ctx, time.Duration(c.ws.redisConfig.HeartbeatTimeoutMs)*time.Millisecond)
+			defer cancelHB()
+
 			pipe := c.ws.redisConn.Pipeline()
 			clientKey := clientHashKey(c.id)
 			updates := map[string]interface{}{
@@ -83,18 +87,18 @@ func (c *client) read() {
 				updates["role"] = string(c.role)
 			}
 
-			pipe.HSet(ctx, clientKey, updates)
+			pipe.HSet(ctxHeartbeat, clientKey, updates)
 			// Extend the TTL every heartbeat to keep the state alive
-			pipe.Expire(ctx, clientKey, 24*time.Hour)
+			pipe.Expire(ctxHeartbeat, clientKey, 24*time.Hour)
 			// Also extend TTL for subscription/publication sets if they exist
-			pipe.Expire(ctx, clientSubsSetKey(c.id), 24*time.Hour)
-			pipe.Expire(ctx, clientPubsSetKey(c.id), 24*time.Hour)
+			pipe.Expire(ctxHeartbeat, clientSubsSetKey(c.id), 24*time.Hour)
+			pipe.Expire(ctxHeartbeat, clientPubsSetKey(c.id), 24*time.Hour)
 
-			_, err := pipe.Exec(ctx)
+			_, err := pipe.Exec(ctxHeartbeat) // Use ctxHeartbeat
 			if err != nil {
 				log.Warn("failed to update client heartbeat state in redis", zap.Error(err), zap.Any("client", c))
 			}
-			c.lastHeartbeat = time.Now() // Update last heartbeat time after attempting update
+			c.lastHeartbeat = time.Now() // Update last heartbeat time after attempting update (even if Exec failed)
 		}
 	}
 }

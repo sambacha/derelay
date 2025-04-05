@@ -22,13 +22,24 @@ const ApproxMaxStreamLen = 10000
 func (ws *WsServer) pubMessage(message SocketMessage) {
 	topic := message.Topic
 	publisher := message.client
+	// ctx := context.TODO() // Remove this, use specific contexts below
 
 	if message.Role == string(Dapp) {
-		// this `notifyDappChanName(topic)` redis channel is used to notify dapp the wallet's status
-		ws.redisSubConn.Subscribe(context.TODO(), dappNotifyChanKey(topic))
+		// Request subscription to the DApp notification channel via the manager
+		select {
+		case ws.subscribeRequests <- []string{dappNotifyChanKey(topic)}:
+			log.Debug("Requested subscription to dapp notify channel", zap.String("topic", topic))
+		case <-ws.ctx.Done():
+			log.Warn("Shutdown requested before subscribing to dapp notify channel", zap.String("topic", topic))
+			return // Don't proceed if shutting down
+		default:
+			// Should not happen with buffered channel unless manager is blocked/slow
+			log.Warn("Subscribe request channel full for dapp notify", zap.String("topic", topic))
+		}
+
 		if message.Phase == string(SessionStart) {
 			metrics.IncEstablishedSessions()
-			return
+			return // No message to publish for SessionStart
 		}
 	}
 
@@ -36,9 +47,13 @@ func (ws *WsServer) pubMessage(message SocketMessage) {
 
 	metrics.IncTotalMessages()
 	key := messageChanKey(topic)
-	if count, _ := ws.redisConn.Publish(context.TODO(), key, message).Result(); count >= 1 {
-		log.Debug("message published", zap.Any("client", publisher), zap.Any("topic", topic))
+	// Publish message using the main redis connection with timeout
+	ctxPub, cancelPub := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.PublishTimeoutMs)*time.Millisecond)
+	defer cancelPub()
+	if count, err := ws.redisConn.Publish(ctxPub, key, message).Result(); err == nil && count >= 1 {
+		log.Debug("message published to redis", zap.Any("client", publisher), zap.String("topic", topic), zap.Int64("subscribers", count))
 		if publisher.role == Dapp {
+			// Send ACK back to DApp publisher immediately after successful publish
 			publisher.send(SocketMessage{
 				Topic: message.Topic,
 				Type:  Ack,
@@ -57,10 +72,11 @@ func (ws *WsServer) pubMessage(message SocketMessage) {
 		// Storing as a single JSON string in a 'message' field
 		msgBytes, err := json.Marshal(message)
 		if err != nil {
-			// Corrected log.Error call
 			log.Error("failed to marshal message for stream cache", err, zap.Any("message", message))
 		} else {
-			_, err = ws.redisConn.XAdd(context.TODO(), &redis.XAddArgs{
+			ctxCache, cancelCache := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.CacheWriteTimeoutMs)*time.Millisecond)
+			defer cancelCache()
+			_, err = ws.redisConn.XAdd(ctxCache, &redis.XAddArgs{ // Use ctxCache
 				Stream: streamKey,
 				MaxLen: ApproxMaxStreamLen, // Trim stream approximately
 				Approx: true,
@@ -74,10 +90,13 @@ func (ws *WsServer) pubMessage(message SocketMessage) {
 		}
 	}
 
-	// Add topic to client's published topics set in Redis
-	if _, err := ws.redisConn.SAdd(context.TODO(), clientPubsSetKey(publisher.id), topic).Result(); err == nil {
-		// Set TTL on first add or periodically refresh
-		ws.redisConn.Expire(context.TODO(), clientPubsSetKey(publisher.id), 24*time.Hour)
+	// Add topic to client's published topics set in Redis with timeout
+	ctxState, cancelState := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond)
+	defer cancelState()
+	if _, err := ws.redisConn.SAdd(ctxState, clientPubsSetKey(publisher.id), topic).Result(); err == nil {
+		// Set TTL on first add or periodically refresh (use same context or new one)
+		// Re-using ctxState here for simplicity, assuming Expire is fast enough
+		ws.redisConn.Expire(ctxState, clientPubsSetKey(publisher.id), 24*time.Hour)
 	} else {
 		log.Warn("failed to add topic to client pubs set", zap.Error(err), zap.Any("client", publisher), zap.String("topic", topic))
 	}
@@ -87,19 +106,25 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 	// Removed duplicate declaration
 	topic := message.Topic
 	subscriber := message.client
-	ctx := context.TODO() // Use a proper context
+	// ctx := context.TODO() // Removed unused variable
 
-	// Subscribe to Pub/Sub channel
-	if err := ws.redisSubConn.Subscribe(ctx, messageChanKey(topic)); err != nil {
-		log.Warn("[redisSub] subscribe to topic fail", zap.String("topic", topic), zap.Any("client", subscriber), zap.Error(err))
-	} else {
-		log.Debug("subscribed to pub/sub topic", zap.String("topic", topic), zap.Any("client", subscriber))
+	// Request subscription to the message channel via the manager
+	select {
+	case ws.subscribeRequests <- []string{messageChanKey(topic)}:
+		log.Debug("Requested subscription to message channel", zap.String("topic", topic), zap.Any("client", subscriber))
+	case <-ws.ctx.Done():
+		log.Warn("Shutdown requested before subscribing to message channel", zap.String("topic", topic), zap.Any("client", subscriber))
+		return // Don't proceed if shutting down
+	default:
+		log.Warn("Subscribe request channel full for message channel", zap.String("topic", topic), zap.Any("client", subscriber))
 	}
 
-	// Add topic to client's subscribed topics set in Redis
-	if _, err := ws.redisConn.SAdd(ctx, clientSubsSetKey(subscriber.id), topic).Result(); err == nil {
-		// Set TTL on first add or periodically refresh
-		ws.redisConn.Expire(ctx, clientSubsSetKey(subscriber.id), 24*time.Hour)
+	// Add topic to client's subscribed topics set in Redis (local state update is immediate) with timeout
+	ctxState, cancelState := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond)
+	defer cancelState()
+	if _, err := ws.redisConn.SAdd(ctxState, clientSubsSetKey(subscriber.id), topic).Result(); err == nil {
+		// Set TTL on first add or periodically refresh (re-use ctxState)
+		ws.redisConn.Expire(ctxState, clientSubsSetKey(subscriber.id), 24*time.Hour)
 	} else {
 		log.Warn("failed to add topic to client subs set", zap.Error(err), zap.Any("client", subscriber), zap.String("topic", topic))
 	}
@@ -109,22 +134,25 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 	groupName := "derelay-cg"     // Consider making group name configurable or more dynamic if needed
 	consumerName := subscriber.id // Use client ID as consumer name
 
-	// Ensure stream and group exist (ignore errors if they already do)
-	// Using MkStream ensures the stream is created if it doesn't exist before reading
-	ws.redisConn.XGroupCreateMkStream(ctx, streamKey, groupName, "0").Result() // Ignore error
+	// Ensure stream and group exist (ignore errors if they already do) with timeout
+	ctxStreamSetup, cancelStreamSetup := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond) // Use state update timeout
+	defer cancelStreamSetup()
+	ws.redisConn.XGroupCreateMkStream(ctxStreamSetup, streamKey, groupName, "0").Result() // Ignore error
 
 	pendingMessages := 0
 	processedIDs := []string{} // Keep track of IDs to ACK
 
 	// Loop to read pending messages (start from 0-0 for this consumer in the group)
 	for {
-		results, err := ws.redisConn.XReadGroup(ctx, &redis.XReadGroupArgs{
+		ctxRead, cancelRead := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StreamReadTimeoutMs)*time.Millisecond)
+		results, err := ws.redisConn.XReadGroup(ctxRead, &redis.XReadGroupArgs{ // Use ctxRead
 			Group:    groupName,
 			Consumer: consumerName,
 			Streams:  []string{streamKey, "0-0"}, // Read pending messages (ID > 0-0)
 			Count:    10,                         // Read in batches
 			Block:    0,                          // Don't block if no messages initially
 		}).Result()
+		cancelRead() // Cancel context as soon as XReadGroup returns
 
 		if err != nil {
 			// If no stream exists yet, that's fine. Otherwise log error.
@@ -173,19 +201,23 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 
 				// notify the topic publisher, aka the dapp, that the session request has been received by wallet
 				dappNotifyKey := dappNotifyChanKey(notification.Topic)
-				ws.redisConn.Publish(ctx, dappNotifyKey, SocketMessage{
+				ctxPub, cancelPub := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.PublishTimeoutMs)*time.Millisecond)
+				ws.redisConn.Publish(ctxPub, dappNotifyKey, SocketMessage{ // Use ctxPub
 					Topic: notification.Topic,
 					Phase: string(SessionReceived),
 					Type:  Ack, // Send ACK type for SessionReceived notification
 					Role:  string(Relay),
 				})
+				cancelPub() // Cancel context
 			}
 		}
 
 		// Acknowledge the processed batch
 		if len(processedIDs) > 0 {
-			ws.redisConn.XAck(ctx, streamKey, groupName, processedIDs...)
-			processedIDs = []string{} // Reset for next batch
+			ctxAck, cancelAck := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond) // Use state update timeout
+			ws.redisConn.XAck(ctxAck, streamKey, groupName, processedIDs...)                                                      // Use ctxAck
+			cancelAck()                                                                                                           // Cancel context
+			processedIDs = []string{}                                                                                             // Reset for next batch
 		}
 
 		// If we read less than requested, we've likely processed all pending
@@ -201,12 +233,14 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 		// NOTE we could check for whether the notifications of this topic is session request, we don't need reply `sessionResumed`
 		// for sessionRequest message, but for simplity we don't do that check here
 		dappNotifyKey := dappNotifyChanKey(message.Topic)
-		ws.redisConn.Publish(ctx, dappNotifyKey, SocketMessage{
+		ctxPubResumed, cancelPubResumed := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.PublishTimeoutMs)*time.Millisecond)
+		ws.redisConn.Publish(ctxPubResumed, dappNotifyKey, SocketMessage{ // Use ctxPubResumed
 			Topic: message.Topic,
 			Type:  Pub, // Send Pub type for SessionResumed notification
 			Role:  string(Relay),
 			Phase: string(SessionResumed),
 		})
+		cancelPubResumed() // Cancel context
 		log.Debug("published session resumed notification", zap.String("topic", topic), zap.Any("client", subscriber))
 	}
 }
@@ -225,7 +259,7 @@ func (ws *WsServer) handlePingMessage(message SocketMessage) {
 // cacheMessage function is removed, logic moved to pubMessage using XAdd
 
 func (ws *WsServer) handleClientDisconnect(client *client) {
-	ctx := context.TODO() // Use a proper context
+	// ctx := context.TODO() // Remove this, use specific contexts below
 
 	// Cleanup local topic maps
 	subscribedTopicsMap := client.subTopics.Get() // Get subscribed topics before clearing
@@ -281,26 +315,28 @@ func (ws *WsServer) handleClientDisconnect(client *client) {
 		}
 
 		if len(finalChannels) > 0 {
-			log.Info("unsubscribing from redis channels", zap.Any("client", client), zap.Strings("channels", finalChannels))
-			// Run in goroutine to avoid blocking the main loop
-			go func() {
-				err := ws.redisSubConn.Unsubscribe(ctx, finalChannels...)
-				if err != nil {
-					// Corrected log.Error call
-					log.Error("failed to unsubscribe from redis channels", err, zap.Strings("channels", finalChannels))
-				}
-			}()
+			log.Info("requesting unsubscribe from redis channels", zap.Any("client", client), zap.Strings("channels", finalChannels))
+			// Send request to the manager goroutine
+			select {
+			case ws.unsubscribeRequests <- finalChannels:
+				// Request sent
+			case <-ws.ctx.Done():
+				log.Warn("Shutdown requested before unsubscribing from channels", zap.Strings("channels", finalChannels))
+			default:
+				log.Warn("Unsubscribe request channel full", zap.Strings("channels", finalChannels))
+			}
 		}
 	}
 
-	// Cleanup client state in Redis
+	// Cleanup client state in Redis with timeout
+	ctxState, cancelState := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond)
+	defer cancelState()
 	pipe := ws.redisConn.Pipeline()
-	pipe.Del(ctx, clientHashKey(client.id))
-	pipe.Del(ctx, clientSubsSetKey(client.id))
-	pipe.Del(ctx, clientPubsSetKey(client.id))
-	_, err := pipe.Exec(ctx)
+	pipe.Del(ctxState, clientHashKey(client.id))
+	pipe.Del(ctxState, clientSubsSetKey(client.id))
+	pipe.Del(ctxState, clientPubsSetKey(client.id))
+	_, err := pipe.Exec(ctxState) // Use ctxState
 	if err != nil {
-		// Corrected log.Error call
 		log.Error("failed to cleanup client state in redis", err, zap.Any("client", client))
 	} else {
 		log.Debug("cleaned up client state in redis", zap.Any("client", client))
@@ -311,8 +347,10 @@ func (ws *WsServer) handleClientDisconnect(client *client) {
 		for topic := range subscribedTopicsMap { // Use the map captured before clearing
 			go func(topic string) {
 				dappNotifyKey := dappNotifyChanKey(topic)
-				// Publish SessionSuspended notification
-				ws.redisConn.Publish(ctx, dappNotifyKey, SocketMessage{
+				// Publish SessionSuspended notification with timeout
+				ctxPub, cancelPub := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.PublishTimeoutMs)*time.Millisecond)
+				defer cancelPub()
+				ws.redisConn.Publish(ctxPub, dappNotifyKey, SocketMessage{ // Use ctxPub
 					Topic: topic,
 					Type:  Pub,
 					Role:  string(Wallet), // Indicate Wallet is the source of the state change

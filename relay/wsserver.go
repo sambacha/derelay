@@ -4,21 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-
+	"sync" // Add sync import
 	"time"
 
 	"github.com/RabbyHub/derelay/config"
 	"github.com/RabbyHub/derelay/log"
 	"github.com/RabbyHub/derelay/metrics"
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
+	"github.com/gorilla/websocket" // Re-add import
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
 type WsServer struct {
-	instanceID string // Unique ID for this server instance
-	config     *config.WsConfig
+	instanceID  string // Unique ID for this server instance
+	config      *config.WsConfig
+	redisConfig *config.RedisConfig // Add Redis config reference
 
 	// connection maintenance
 	clients    map[*client]struct{}
@@ -26,23 +27,29 @@ type WsServer struct {
 	unregister chan ClientUnregisterEvent
 
 	redisConn    *redis.Client
-	redisSubConn *redis.PubSub
+	redisSubConn *redis.PubSub // Still potentially useful for direct access if needed, managed by goroutine
 
 	publishers  *TopicClientSet
 	subscribers *TopicClientSet
 
-	localCh chan SocketMessage // for handling message of local clients
+	localCh             chan SocketMessage  // for handling message of local clients
+	remoteMessages      chan *redis.Message // Messages received from PubSub manager
+	subscribeRequests   chan []string       // Channel to request subscriptions
+	unsubscribeRequests chan []string       // Channel to request unsubscriptions
+
+	ctx    context.Context    // Context for managing goroutine lifecycle
+	cancel context.CancelFunc // Func to cancel the context
+
+	clientWG sync.WaitGroup // WaitGroup for active client goroutines
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // TODO Only white list allowed origins
-	},
-}
+// upgrader is configured in NewWSServer now, as it needs access to config
+// var upgrader = websocket.Upgrader{ ... } // Removed global variable
 
 func NewWSServer(config *config.Config) *WsServer {
 	ws := &WsServer{
-		config: &config.WsServerConfig, // config
+		config:      &config.WsServerConfig,    // config
+		redisConfig: &config.RedisServerConfig, // Store reference to redis config
 
 		clients:    make(map[*client]struct{}),
 		register:   make(chan *client, 4096),
@@ -61,15 +68,51 @@ func NewWSServer(config *config.Config) *WsServer {
 		Password: config.RedisServerConfig.Password,
 		DB:       0,
 	})
-	ws.redisSubConn = ws.redisConn.Subscribe(context.TODO())
+	// ws.redisSubConn = ws.redisConn.Subscribe(context.TODO()) // Removed: Manager goroutine handles this
+
+	// Initialize context and channels for the manager goroutine
+	ws.ctx, ws.cancel = context.WithCancel(context.Background())
+	ws.remoteMessages = make(chan *redis.Message, 128) // Buffered channel
+	ws.subscribeRequests = make(chan []string, 32)
+	ws.unsubscribeRequests = make(chan []string, 32)
+
+	// Start the PubSub connection manager goroutine
+	go ws.managePubSubConnection()
 
 	return ws
 }
 
 func (ws *WsServer) NewClientConn(w http.ResponseWriter, r *http.Request) {
+	// Configure upgrader dynamically based on ws.config
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			// If AllowedOrigins is empty or nil, allow all origins
+			if len(ws.config.AllowedOrigins) == 0 {
+				return true
+			}
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				// Allow requests with no Origin header? Or deny? Denying is safer.
+				return false
+			}
+			for _, allowed := range ws.config.AllowedOrigins {
+				// Current logic: exact match or wildcard "*"
+				if allowed == "*" || allowed == origin {
+					return true
+				}
+			}
+			log.Warn("WebSocket origin denied", zap.String("origin", origin), zap.Strings("allowed", ws.config.AllowedOrigins))
+			return false
+		},
+		// Add other upgrader options if needed (ReadBufferSize, WriteBufferSize)
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		// ignore the clients who ain't mean to do websocket communication with us
+		// Log upgrade errors for debugging, but don't flood logs for non-websocket requests
+		// Check for specific websocket handshake errors if possible
+		log.Debug("WebSocket upgrade failed", zap.Error(err), zap.String("remoteAddr", r.RemoteAddr), zap.String("origin", r.Header.Get("Origin")))
+		// Return directly without sending an HTTP error response, as Upgrade handles that.
 		return
 	}
 
@@ -85,17 +128,23 @@ func (ws *WsServer) NewClientConn(w http.ResponseWriter, r *http.Request) {
 
 	ws.register <- client
 
+	// Add client to WaitGroup before starting goroutines
+	ws.clientWG.Add(1)
 	go client.read()
 	go client.write()
 }
 
 func (ws *WsServer) Run() {
-	log.Info("Websocket server has been started")
-
-	remoteCh := ws.redisSubConn.Channel()
+	log.Info("Websocket server Run loop started")
+	// remoteCh := ws.redisSubConn.Channel() // Removed: Using ws.remoteMessages now
 
 	for {
 		select {
+		// Handle shutdown signal
+		case <-ws.ctx.Done():
+			log.Info("WsServer Run loop stopping due to context cancellation.")
+			return
+
 		case message := <-ws.localCh:
 			// local message could be "pub", "sub" or "ack" or "ping"
 			// pub/sub message handler may contain time-consuming operations(e.g. read/write redis)
@@ -115,48 +164,24 @@ func (ws *WsServer) Run() {
 			case Ping:
 				ws.handlePingMessage(message)
 			}
-		case chmessage, ok := <-remoteCh:
-			// Check if the channel is closed (might indicate PubSub connection issue)
-			if !ok {
-				log.Warn("Redis PubSub channel closed. Attempting to re-subscribe.")
-				// Attempt to re-establish the subscription
-				// Note: This is a basic recovery attempt. A more robust solution
-				// might involve a dedicated connection manager goroutine.
-				ws.redisSubConn = ws.redisConn.Subscribe(context.TODO()) // Re-subscribe (might block)
-				if ws.redisSubConn == nil {
-					log.Error("Failed to re-subscribe to Redis PubSub. Exiting Run loop.", nil) // Or handle differently
-					// Consider more drastic action like server restart or backoff retry
-					return // Exit loop if re-subscription fails critically
-				}
-				// Need to re-subscribe to all topics currently tracked
-				topicsToResubscribe := ws.getAllActiveTopics()
-				if len(topicsToResubscribe) > 0 {
-					err := ws.redisSubConn.Subscribe(context.TODO(), topicsToResubscribe...)
-					if err != nil {
-						log.Error("Failed to re-subscribe to topics after connection loss", err, zap.Strings("topics", topicsToResubscribe))
-						// Potentially exit or retry
-					} else {
-						log.Info("Successfully re-subscribed to topics", zap.Strings("topics", topicsToResubscribe))
-					}
-				}
-				remoteCh = ws.redisSubConn.Channel() // Get the new channel
-				continue                             // Continue to next select iteration
-			}
+		// Receive messages from the PubSub manager goroutine
+		case msg := <-ws.remoteMessages:
+			// Reconnection logic is now handled by managePubSubConnection goroutine
 
 			// Process the received message
 			message := SocketMessage{}
-			err := json.Unmarshal([]byte(chmessage.Payload), &message)
+			err := json.Unmarshal([]byte(msg.Payload), &message) // Use msg.Payload
 			if err != nil {
-				log.Warn("malformed message from remote", zap.String("payload", chmessage.Payload), zap.Error(err))
+				log.Warn("malformed message from remote", zap.String("payload", msg.Payload), zap.Error(err))
 				continue
 			}
-			log.Info("remote message", zap.Any("message", message))
+			log.Debug("remote message received", zap.Any("message", message), zap.String("channel", msg.Channel)) // Log channel too
 
 			// if message is not from `dappNotifyChan`, then must be from `messageChan` and must be a "pub" message
-			if !fromDappNotifyChan(chmessage.Channel) {
+			if !fromDappNotifyChan(msg.Channel) { // Check msg.Channel
 				for _, subscriber := range ws.GetSubscriber(message.Topic) {
-					log.Info("forward to subscriber", zap.Any("client", subscriber), zap.Any("message", message))
-					subscriber.send(message)
+					log.Debug("forwarding remote pub to subscriber", zap.Any("client", subscriber), zap.Any("message", message))
+					subscriber.send(message) // Forward the unmarshaled SocketMessage
 				}
 				continue
 			}
@@ -208,6 +233,9 @@ func (ws *WsServer) Run() {
 			metrics.IncClosedConnection()
 			metrics.SetCurrentConnections(len(ws.clients))
 			log.Info("client disconnected", zap.Any("client", client), zap.String("reason", reason.Error()))
+
+			// Decrement WaitGroup after handling unregistration
+			ws.clientWG.Done()
 		}
 	}
 }
@@ -276,14 +304,155 @@ func (ws *WsServer) GetDappPublisher(topic string) []*client {
 // getCachedMessages function is removed as caching is now handled by reading from streams in subMessage
 
 func (ws *WsServer) Shutdown() {
-	// TODO: Implement graceful shutdown logic if needed
-	// - Close redis connections?
-	// - Wait for client goroutines? (terminate signals them)
+	// Graceful shutdown logic: Signal the manager goroutine to stop and close connections.
 	log.Info("WsServer shutting down", zap.String("instanceID", ws.instanceID))
-	if ws.redisSubConn != nil {
-		ws.redisSubConn.Close()
+
+	// Signal the PubSub manager goroutine to stop
+	if ws.cancel != nil {
+		ws.cancel()
 	}
+
+	// Close the main Redis connection
 	if ws.redisConn != nil {
 		ws.redisConn.Close()
 	}
+	// The managePubSubConnection goroutine is responsible for closing its own redisSubConn
+
+	// Wait for all client goroutines to finish
+	log.Info("Waiting for client goroutines to shut down...")
+	ws.clientWG.Wait()
+	log.Info("All client goroutines shut down.")
+}
+
+// managePubSubConnection runs in a background goroutine to handle the Redis PubSub connection.
+func (ws *WsServer) managePubSubConnection() {
+	defer log.Info("PubSub connection manager stopped.")
+	log.Info("PubSub connection manager started.")
+
+	var currentSubConn *redis.PubSub
+	var msgCh <-chan *redis.Message
+	backoff := time.Second // Initial backoff duration
+
+	for {
+		select {
+		case <-ws.ctx.Done(): // Check for shutdown signal first
+			if currentSubConn != nil {
+				currentSubConn.Close()
+			}
+			return
+		default:
+			// Attempt to establish connection if not currently connected
+			if currentSubConn == nil {
+				log.Info("Attempting to establish PubSub connection...")
+				subConn := ws.redisConn.Subscribe(ws.ctx) // Use ws.ctx
+				if subConn == nil {                       // Check if Subscribe itself failed immediately
+					log.Error("Failed to initiate PubSub subscription.", nil)
+					// Wait before retrying
+					time.Sleep(backoff)
+					backoff = min(backoff*2, 30*time.Second) // Exponential backoff up to 30s
+					continue
+				}
+
+				// Verify connection by trying to receive confirmation (optional but good practice)
+				_, err := subConn.Receive(ws.ctx)
+				if err != nil {
+					log.Error("Failed to verify PubSub subscription.", err)
+					subConn.Close()
+					time.Sleep(backoff)
+					backoff = min(backoff*2, 30*time.Second)
+					continue
+				}
+
+				log.Info("PubSub connection established.")
+				currentSubConn = subConn
+				msgCh = currentSubConn.Channel()
+				backoff = time.Second // Reset backoff on successful connection
+
+				// Re-subscribe to all necessary topics
+				topicsToResubscribe := ws.getAllActiveTopics()
+				if len(topicsToResubscribe) > 0 {
+					log.Info("Re-subscribing to active topics", zap.Strings("topics", topicsToResubscribe))
+					err := currentSubConn.Subscribe(ws.ctx, topicsToResubscribe...)
+					if err != nil {
+						log.Error("Failed to re-subscribe to topics after connection.", err)
+						// Connection might be unhealthy, close and retry
+						currentSubConn.Close()
+						currentSubConn = nil
+						msgCh = nil
+						continue // Retry connection
+					}
+				}
+			}
+
+			// Inner select loop for active connection
+			select {
+			case <-ws.ctx.Done():
+				if currentSubConn != nil {
+					currentSubConn.Close()
+				}
+				return
+
+			case msg, ok := <-msgCh:
+				if !ok {
+					log.Warn("PubSub message channel closed. Connection lost.")
+					currentSubConn.Close() // Ensure closed
+					currentSubConn = nil
+					msgCh = nil
+					// No sleep here, outer loop will handle backoff retry
+				} else {
+					// Forward message to main Run loop
+					select {
+					case ws.remoteMessages <- msg:
+					// Message forwarded
+					case <-ws.ctx.Done():
+						// Shutdown during forward attempt
+						if currentSubConn != nil {
+							currentSubConn.Close()
+						}
+						return
+					}
+				}
+
+			case topics := <-ws.subscribeRequests:
+				if currentSubConn != nil {
+					log.Debug("Processing subscribe request", zap.Strings("topics", topics))
+					err := currentSubConn.Subscribe(ws.ctx, topics...)
+					if err != nil {
+						log.Error("Failed to subscribe to topics", err, zap.Strings("topics", topics))
+						// Assume connection is broken, trigger reconnect
+						currentSubConn.Close()
+						currentSubConn = nil
+						msgCh = nil
+					}
+				} else {
+					log.Warn("Received subscribe request while PubSub disconnected.", zap.Strings("topics", topics))
+					// Topics will be subscribed on next successful connection
+				}
+
+			case topics := <-ws.unsubscribeRequests:
+				if currentSubConn != nil {
+					log.Debug("Processing unsubscribe request", zap.Strings("topics", topics))
+					err := currentSubConn.Unsubscribe(ws.ctx, topics...)
+					if err != nil {
+						log.Error("Failed to unsubscribe from topics", err, zap.Strings("topics", topics))
+						// Assume connection is broken, trigger reconnect
+						currentSubConn.Close()
+						currentSubConn = nil
+						msgCh = nil
+					}
+				} else {
+					log.Warn("Received unsubscribe request while PubSub disconnected.", zap.Strings("topics", topics))
+					// No action needed if disconnected
+				}
+			}
+		}
+	}
+}
+
+// min helper for backoff calculation
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
