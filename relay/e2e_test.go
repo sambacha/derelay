@@ -1,6 +1,6 @@
 //go:build e2e
 
-package relay
+package relay_test
 
 import (
 	"context"

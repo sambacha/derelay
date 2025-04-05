@@ -1,4 +1,4 @@
-package main
+package relay
 
 import (
 	"errors" // Add import for errors.Is
@@ -16,6 +16,7 @@ import (
 	"github.com/RabbyHub/derelay/metrics"
 	"github.com/RabbyHub/derelay/relay"
 	"github.com/gorilla/mux"
+	"github.com/redis/go-redis/v9" // Correct import path
 )
 
 func startMetricServer(config *config.MetricConfig) {
@@ -85,7 +86,16 @@ func main() {
 
 	config := parseCmdlineAndLoadConfig()
 
-	wsServer := relay.NewWSServer(&config)
+	// Create the concrete Redis client
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     config.RedisServerConfig.ServerAddr,
+		Password: config.RedisServerConfig.Password,
+		DB:       0, // Use the appropriate DB number if needed
+	})
+	// TODO: Add error handling for redis.NewClient if necessary, though it typically doesn't error
+
+	// Pass the concrete client (which satisfies RelayRedisIO) to the constructor
+	wsServer := relay.NewWSServer(&config, redisClient)
 	relayServer := relay.NewRelayServer(&config.RelayServerConfig, wsServer)
 
 	// start websocket server

@@ -30,6 +30,23 @@ type client struct {
 	lastHeartbeat time.Time // Track last heartbeat sent to Redis/DragonflyDB
 }
 
+// --- ClientSender Interface Implementation ---
+
+// Send implements the ClientSender interface.
+// It's already defined below as the primary send method.
+
+// ID implements the ClientSender interface.
+func (c *client) ID() string {
+	return c.id
+}
+
+// Role implements the ClientSender interface.
+func (c *client) Role() RoleType {
+	return c.role
+}
+
+// --- Other Methods ---
+
 func (c *client) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	if c != nil {
 		encoder.AddString("id", c.id)
@@ -45,9 +62,18 @@ func (c *client) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	return nil
 }
 
+// decodeSocketMessage attempts to decode a byte slice into a SocketMessage.
+func decodeSocketMessage(data []byte) (SocketMessage, error) {
+	var message SocketMessage
+	// Use DisallowUnknownFields to be stricter about the input structure
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(&message)
+	return message, err // Return the message and any decoding error
+}
+
 func (c *client) read() {
 	c.lastHeartbeat = time.Now() // Initialize heartbeat time on read start
-	// ctx := context.TODO() // Removed unused variable
 
 	for {
 		_, m, err := c.conn.ReadMessage()
@@ -56,13 +82,12 @@ func (c *client) read() {
 			return           // Exit read loop on error
 		}
 
-		// Decode message
-		message := SocketMessage{}
-		// Use '=' to avoid shadowing outer 'err'
-		if err = json.NewDecoder(bytes.NewReader(m)).Decode(&message); err != nil {
+		// Decode message using the new function
+		message, err := decodeSocketMessage(m)
+		if err != nil {
 			log.Warn(
 				"[wsconn] received malformed text message",
-				zap.Error(err),
+				zap.Error(err), // Log the decoding error
 				zap.String("raw", string(m)),
 				zap.Any("client", c),
 			)
@@ -137,8 +162,9 @@ func (c *client) write() {
 	}
 }
 
-// send implements a non-blocking sending
-func (c *client) send(message SocketMessage) {
+// send implements a non-blocking sending. It also fulfills the Send method
+// requirement of the ClientSender interface.
+func (c *client) Send(message SocketMessage) {
 	select {
 	case c.sendbuf <- message:
 	default:

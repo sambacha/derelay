@@ -26,8 +26,8 @@ type WsServer struct {
 	register   chan *client
 	unregister chan ClientUnregisterEvent
 
-	redisConn    *redis.Client
-	redisSubConn *redis.PubSub // Still potentially useful for direct access if needed, managed by goroutine
+	redisConn    RelayRedisIO  // Changed to use the interface
+	redisSubConn *redis.PubSub // PubSub connection might need separate handling or interface
 
 	publishers  *TopicClientSet
 	subscribers *TopicClientSet
@@ -46,10 +46,13 @@ type WsServer struct {
 // upgrader is configured in NewWSServer now, as it needs access to config
 // var upgrader = websocket.Upgrader{ ... } // Removed global variable
 
-func NewWSServer(config *config.Config) *WsServer {
+// NewWSServer creates a new WsServer instance.
+// It now requires a RelayRedisIO implementation to be passed in for testability.
+func NewWSServer(config *config.Config, redisIO RelayRedisIO) *WsServer {
 	ws := &WsServer{
 		config:      &config.WsServerConfig,    // config
 		redisConfig: &config.RedisServerConfig, // Store reference to redis config
+		redisConn:   redisIO,                   // Assign the provided interface implementation
 
 		clients:    make(map[*client]struct{}),
 		register:   make(chan *client, 4096),
@@ -68,7 +71,15 @@ func NewWSServer(config *config.Config) *WsServer {
 		Password: config.RedisServerConfig.Password,
 		DB:       0,
 	})
-	// ws.redisSubConn = ws.redisConn.Subscribe(context.TODO()) // Removed: Manager goroutine handles this
+	// NOTE: The concrete redis.Client still needs to be created somewhere
+	// (e.g., in main.go) and passed into NewWSServer.
+	// The redisSubConn handling within managePubSubConnection might need adjustment
+	// as it currently uses methods specific to the concrete *redis.Client.
+	// Option 1: Add Subscribe/Receive/Channel methods to RelayRedisIO interface.
+	// Option 2: Pass both the RelayRedisIO and a concrete *redis.Client for PubSub.
+	// Option 3: Refactor managePubSubConnection significantly.
+	// For now, we assume the passed redisIO can handle what's needed,
+	// but managePubSubConnection will likely fail compilation later.
 
 	// Initialize context and channels for the manager goroutine
 	ws.ctx, ws.cancel = context.WithCancel(context.Background())
@@ -211,7 +222,7 @@ func (ws *WsServer) Run() {
 						zap.Any("client", subscriber),
 						zap.Any("message", message),
 					)
-					subscriber.send(message) // Forward the unmarshaled SocketMessage
+					subscriber.Send(message) // Forward the unmarshaled SocketMessage
 				}
 				continue
 			}
@@ -224,7 +235,7 @@ func (ws *WsServer) Run() {
 			// 	* relay generated fake "ack" for the wallet
 			for _, publisher := range ws.GetDappPublisher(message.Topic) {
 				log.Debug("wallet updates, notify dapp", zap.Any("client", publisher), zap.Any("message", message))
-				publisher.send(message)
+				publisher.Send(message)
 			}
 
 		case client := <-ws.register:

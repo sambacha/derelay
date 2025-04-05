@@ -57,9 +57,9 @@ func (ws *WsServer) pubMessage(message SocketMessage) {
 			zap.String("topic", topic),
 			zap.Int64("subscribers", count),
 		)
-		if publisher.role == Dapp {
+		if publisher.Role() == Dapp { // Use Role() method
 			// Send ACK back to DApp publisher immediately after successful publish
-			publisher.send(SocketMessage{
+			publisher.Send(SocketMessage{ // Use Send() method
 				Topic: message.Topic,
 				Type:  Ack,
 				Role:  string(Wallet),
@@ -255,7 +255,7 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 			}
 
 			// Send the retrieved message to the client
-			subscriber.send(notification)
+			subscriber.Send(notification)                     // Use Send() method
 			processedIDs = append(processedIDs, streamMsg.ID) // Mark for ACK
 
 			// Wallet-specific logic for SessionRequest found in stream
@@ -338,8 +338,8 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 
 func (ws *WsServer) handlePingMessage(message SocketMessage) {
 	// response to application layer ping message
-	client := message.client
-	client.send(SocketMessage{
+	sender := message.client   // Assuming message.client is now ClientSender or *client
+	sender.Send(SocketMessage{ // Use Send() method
 		Type: Pong,
 		Role: string(Relay), // Identify relay in pong
 	})
