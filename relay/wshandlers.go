@@ -70,20 +70,22 @@ func (ws *WsServer) pubMessage(message SocketMessage) {
 		streamKey := streamMessageKey(topic)
 		// Marshal the message to store in the stream
 		// Storing as a single JSON string in a 'message' field
-		msgBytes, err := json.Marshal(message)
-		if err != nil {
-			log.Error("failed to marshal message for stream cache", err, zap.Any("message", message))
+		var marshalErr error // Explicit var for marshal
+		msgBytes, marshalErr := json.Marshal(message)
+		if marshalErr != nil {
+			log.Error("failed to marshal message for stream cache", marshalErr, zap.Any("message", message))
 		} else {
 			ctxCache, cancelCache := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.CacheWriteTimeoutMs)*time.Millisecond)
 			defer cancelCache()
-			_, err = ws.redisConn.XAdd(ctxCache, &redis.XAddArgs{ // Use ctxCache
+			var xaddErr error                                         // Explicit var for XAdd
+			_, xaddErr = ws.redisConn.XAdd(ctxCache, &redis.XAddArgs{ // Use ctxCache
 				Stream: streamKey,
 				MaxLen: ApproxMaxStreamLen, // Trim stream approximately
 				Approx: true,
 				Values: map[string]interface{}{"message": string(msgBytes)},
 			}).Result()
-			if err != nil {
-				log.Warn("failed to cache message to stream", zap.Error(err), zap.Any("message", message))
+			if xaddErr != nil {
+				log.Warn("failed to cache message to stream", zap.Error(xaddErr), zap.Any("message", message))
 			} else {
 				log.Debug("message cached to stream", zap.Any("client", publisher), zap.Any("topic", topic))
 			}
@@ -93,12 +95,14 @@ func (ws *WsServer) pubMessage(message SocketMessage) {
 	// Add topic to client's published topics set in Redis with timeout
 	ctxState, cancelState := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond)
 	defer cancelState()
-	if _, err := ws.redisConn.SAdd(ctxState, clientPubsSetKey(publisher.id), topic).Result(); err == nil {
+	var saddPubErr error // Explicit var for SAdd Pub
+	_, saddPubErr = ws.redisConn.SAdd(ctxState, clientPubsSetKey(publisher.id), topic).Result()
+	if saddPubErr == nil { // Check the explicitly declared error variable
 		// Set TTL on first add or periodically refresh (use same context or new one)
 		// Re-using ctxState here for simplicity, assuming Expire is fast enough
 		ws.redisConn.Expire(ctxState, clientPubsSetKey(publisher.id), 24*time.Hour)
 	} else {
-		log.Warn("failed to add topic to client pubs set", zap.Error(err), zap.Any("client", publisher), zap.String("topic", topic))
+		log.Warn("failed to add topic to client pubs set", zap.Error(saddPubErr), zap.Any("client", publisher), zap.String("topic", topic))
 	}
 }
 
@@ -120,13 +124,15 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 	}
 
 	// Add topic to client's subscribed topics set in Redis (local state update is immediate) with timeout
-	ctxState, cancelState := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond)
-	defer cancelState()
-	if _, err := ws.redisConn.SAdd(ctxState, clientSubsSetKey(subscriber.id), topic).Result(); err == nil {
-		// Set TTL on first add or periodically refresh (re-use ctxState)
-		ws.redisConn.Expire(ctxState, clientSubsSetKey(subscriber.id), 24*time.Hour)
+	ctxStateSub, cancelStateSub := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond)
+	defer cancelStateSub() // Correct placement
+	var saddSubErr error   // Explicitly declare error variable
+	_, saddSubErr = ws.redisConn.SAdd(ctxStateSub, clientSubsSetKey(subscriber.id), topic).Result()
+	if saddSubErr == nil { // Check the explicitly declared error variable
+		// Set TTL on first add or periodically refresh (re-use ctxStateSub)
+		ws.redisConn.Expire(ctxStateSub, clientSubsSetKey(subscriber.id), 24*time.Hour)
 	} else {
-		log.Warn("failed to add topic to client subs set", zap.Error(err), zap.Any("client", subscriber), zap.String("topic", topic))
+		log.Warn("failed to add topic to client subs set", zap.Error(saddSubErr), zap.Any("client", subscriber), zap.String("topic", topic))
 	}
 
 	// Read pending messages from stream for this client
@@ -136,11 +142,13 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 
 	// Ensure stream and group exist (ignore errors if they already do) with timeout
 	ctxStreamSetup, cancelStreamSetup := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond) // Use state update timeout
+	defer cancelStreamSetup()                                                                                                             // Correct placement
 	// Check error, but log as warning since "BUSYGROUP Consumer Group name already exists" is expected often
+	// Use ':=' because 'err' from the previous scope is not visible here.
 	if err := ws.redisConn.XGroupCreateMkStream(ctxStreamSetup, streamKey, groupName, "0").Err(); err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 		log.Warn("Failed to create stream group (or stream)", zap.Error(err), zap.String("stream", streamKey), zap.String("group", groupName))
 	}
-	cancelStreamSetup() // Cancel context after use
+	// cancelStreamSetup() // Removed explicit cancel, defer handles it
 
 	pendingMessages := 0
 	processedIDs := []string{} // Keep track of IDs to ACK
@@ -148,7 +156,9 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 	// Loop to read pending messages (start from 0-0 for this consumer in the group)
 	for {
 		ctxRead, cancelRead := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StreamReadTimeoutMs)*time.Millisecond)
-		results, err := ws.redisConn.XReadGroup(ctxRead, &redis.XReadGroupArgs{ // Use ctxRead
+		var results []redis.XStream // Declare results outside assignment
+		// Use '=' to avoid shadowing outer 'err'
+		results, err = ws.redisConn.XReadGroup(ctxRead, &redis.XReadGroupArgs{ // Use ctxRead
 			Group:    groupName,
 			Consumer: consumerName,
 			Streams:  []string{streamKey, "0-0"}, // Read pending messages (ID > 0-0)
@@ -182,8 +192,8 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 			}
 
 			var notification SocketMessage
-			if err := json.Unmarshal([]byte(msgData), &notification); err != nil {
-				// Corrected log.Error call
+			// Use '=' to avoid shadowing outer 'err'
+			if err = json.Unmarshal([]byte(msgData), &notification); err != nil {
 				log.Error("failed to unmarshal message from stream", err, zap.String("stream", streamKey), zap.String("msgID", streamMsg.ID))
 				// Consider acknowledging malformed messages
 				processedIDs = append(processedIDs, streamMsg.ID)
@@ -332,14 +342,14 @@ func (ws *WsServer) handleClientDisconnect(client *client) {
 	}
 
 	// Cleanup client state in Redis with timeout
-	ctxState, cancelState := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond)
-	defer cancelState()
+	ctxStateDisconnect, cancelStateDisconnect := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond)
+	defer cancelStateDisconnect() // Correct placement
 	pipe := ws.redisConn.Pipeline()
-	pipe.Del(ctxState, clientHashKey(client.id))
-	pipe.Del(ctxState, clientSubsSetKey(client.id))
-	pipe.Del(ctxState, clientPubsSetKey(client.id))
-	_, err := pipe.Exec(ctxState) // Use ctxState
-	if err != nil {
+	pipe.Del(ctxStateDisconnect, clientHashKey(client.id))
+	pipe.Del(ctxStateDisconnect, clientSubsSetKey(client.id))
+	pipe.Del(ctxStateDisconnect, clientPubsSetKey(client.id))
+	// Use ':=' because 'err' from the previous scope is not visible here.
+	if _, err := pipe.Exec(ctxStateDisconnect); err != nil {
 		log.Error("failed to cleanup client state in redis", err, zap.Any("client", client))
 	} else {
 		log.Debug("cleaned up client state in redis", zap.Any("client", client))

@@ -40,7 +40,8 @@ func newTCPConn(address string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := conn.SetReadDeadline(time.Now()); err != nil {
+	// Use '=' to avoid shadowing outer 'err'
+	if err = conn.SetReadDeadline(time.Now()); err != nil {
 		return nil, err
 	}
 	return conn, nil
@@ -109,7 +110,8 @@ func (s *fluentBitTCPSink) sendData(doneC chan<- struct{}) {
 		// In go 1.7+, zero byte reads return immediately and will never return an error.
 		// You must read at least one byte.
 		// Use errors.Is for checking specific errors like io.EOF
-		if _, err := conn.Read(s.oneByte); errors.Is(err, io.EOF) {
+		// Use '=' to avoid shadowing outer 'err'
+		if _, err = conn.Read(s.oneByte); errors.Is(err, io.EOF) {
 			Error("connection closed by peer", nil) // More specific message
 			goto DONE
 		} else if err != nil {
@@ -117,7 +119,8 @@ func (s *fluentBitTCPSink) sendData(doneC chan<- struct{}) {
 			Error("error checking connection status", err)
 			goto DONE
 		}
-		if _, err := conn.Write(s.buffer.Bytes()); err != nil {
+		// Use '=' to avoid shadowing outer 'err'
+		if _, err = conn.Write(s.buffer.Bytes()); err != nil {
 			Error("write data error", err)
 			goto DONE
 		}

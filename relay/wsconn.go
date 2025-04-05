@@ -58,7 +58,8 @@ func (c *client) read() {
 
 		// Decode message
 		message := SocketMessage{}
-		if err := json.NewDecoder(bytes.NewReader(m)).Decode(&message); err != nil {
+		// Use '=' to avoid shadowing outer 'err'
+		if err = json.NewDecoder(bytes.NewReader(m)).Decode(&message); err != nil {
 			log.Warn("[wsconn] received malformed text message", zap.Error(err), zap.String("raw", string(m)), zap.Any("client", c))
 			continue // Skip malformed message
 		}
@@ -99,8 +100,8 @@ func (c *client) read() {
 			pipe.Expire(ctxHeartbeat, clientSubsSetKey(c.id), 24*time.Hour)
 			pipe.Expire(ctxHeartbeat, clientPubsSetKey(c.id), 24*time.Hour)
 
-			_, err := pipe.Exec(ctxHeartbeat) // Use ctxHeartbeat
-			if err != nil {
+			// Use '=' to avoid shadowing outer 'err'
+			if _, err = pipe.Exec(ctxHeartbeat); err != nil {
 				log.Warn("failed to update client heartbeat state in redis", zap.Error(err), zap.Any("client", c))
 			}
 			c.lastHeartbeat = time.Now() // Update last heartbeat time after attempting update (even if Exec failed)

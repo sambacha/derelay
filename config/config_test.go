@@ -26,7 +26,8 @@ func TestConfigOverwritten(t *testing.T) {
 	}
 	defer os.Remove(tmpfile.Name())
 
-	if err := yaml.NewEncoder(tmpfile).Encode(expectedConfig); err != nil {
+	// Use '=' to avoid shadowing outer 'err'
+	if err = yaml.NewEncoder(tmpfile).Encode(expectedConfig); err != nil {
 		panic(err)
 	}
 
@@ -58,10 +59,12 @@ redis_config:
 	}
 	defer os.Remove(tmpfile.Name())
 
-	if _, err := tmpfile.WriteString(raw); err != nil {
+	// Use '=' to avoid shadowing outer 'err'
+	if _, err = tmpfile.WriteString(raw); err != nil {
 		panic(err)
 	}
-	if err := tmpfile.Close(); err != nil {
+	// Use '=' to avoid shadowing outer 'err'
+	if err = tmpfile.Close(); err != nil {
 		panic(err)
 	}
 

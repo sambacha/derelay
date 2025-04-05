@@ -3,3 +3,8 @@ derelay
 .DS_Store
 node_modules
 .cache/
+
+vendor
+*.swp
+dist/
+*.log
