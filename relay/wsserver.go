@@ -10,9 +10,10 @@ import (
 	"github.com/RabbyHub/derelay/config"
 	"github.com/RabbyHub/derelay/log"
 	"github.com/RabbyHub/derelay/metrics"
+	"github.com/RabbyHub/derelay/ports" // Import the new ports package
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket" // Re-add import
-	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9" // Keep for PubSub concrete type
 	"go.uber.org/zap"
 )
 
@@ -26,8 +27,7 @@ type WsServer struct {
 	register   chan *client
 	unregister chan ClientUnregisterEvent
 
-	redisConn    *redis.Client
-	redisSubConn *redis.PubSub // Still potentially useful for direct access if needed, managed by goroutine
+	redisConn ports.RedisClient // Use the interface
 
 	publishers  *TopicClientSet
 	subscribers *TopicClientSet
@@ -46,10 +46,12 @@ type WsServer struct {
 // upgrader is configured in NewWSServer now, as it needs access to config
 // var upgrader = websocket.Upgrader{ ... } // Removed global variable
 
-func NewWSServer(config *config.Config) *WsServer {
+// NewWSServer now takes the RedisClient interface and config structs directly
+func NewWSServer(wsCfg *config.WsConfig, redisCfg *config.RedisConfig, redisClient ports.RedisClient) *WsServer {
 	ws := &WsServer{
-		config:      &config.WsServerConfig,    // config
-		redisConfig: &config.RedisServerConfig, // Store reference to redis config
+		config:      wsCfg,       // Use injected config
+		redisConfig: redisCfg,    // Use injected config
+		redisConn:   redisClient, // Use injected client
 
 		clients:    make(map[*client]struct{}),
 		register:   make(chan *client, 4096),
@@ -63,12 +65,7 @@ func NewWSServer(config *config.Config) *WsServer {
 	ws.instanceID = uuid.NewString() // Generate unique ID for this instance
 	log.Info("Initializing WsServer", zap.String("instanceID", ws.instanceID))
 
-	ws.redisConn = redis.NewClient(&redis.Options{
-		Addr:     config.RedisServerConfig.ServerAddr,
-		Password: config.RedisServerConfig.Password,
-		DB:       0,
-	})
-	// ws.redisSubConn = ws.redisConn.Subscribe(context.TODO()) // Removed: Manager goroutine handles this
+	// Redis client creation moved outside to main.go
 
 	// Initialize context and channels for the manager goroutine
 	ws.ctx, ws.cancel = context.WithCancel(context.Background())
@@ -314,7 +311,9 @@ func (ws *WsServer) Shutdown() {
 
 	// Close the main Redis connection
 	if ws.redisConn != nil {
-		ws.redisConn.Close()
+		if err := ws.redisConn.Close(); err != nil {
+			log.Error("Error closing main redis connection", err) // Correct signature
+		}
 	}
 	// The managePubSubConnection goroutine is responsible for closing its own redisSubConn
 
@@ -337,7 +336,9 @@ func (ws *WsServer) managePubSubConnection() {
 		select {
 		case <-ws.ctx.Done(): // Check for shutdown signal first
 			if currentSubConn != nil {
-				currentSubConn.Close()
+				if err := currentSubConn.Close(); err != nil {
+					log.Error("Error closing pubsub connection on shutdown", err) // Correct signature
+				}
 			}
 			return
 		default:
@@ -395,7 +396,9 @@ func (ws *WsServer) managePubSubConnection() {
 			case msg, ok := <-msgCh:
 				if !ok {
 					log.Warn("PubSub message channel closed. Connection lost.")
-					currentSubConn.Close() // Ensure closed
+					if err := currentSubConn.Close(); err != nil { // Ensure closed
+						log.Error("Error closing pubsub connection after channel close", err) // Correct signature
+					}
 					currentSubConn = nil
 					msgCh = nil
 					// No sleep here, outer loop will handle backoff retry
@@ -418,9 +421,11 @@ func (ws *WsServer) managePubSubConnection() {
 					log.Debug("Processing subscribe request", zap.Strings("topics", topics))
 					err := currentSubConn.Subscribe(ws.ctx, topics...)
 					if err != nil {
-						log.Error("Failed to subscribe to topics", err, zap.Strings("topics", topics))
+						log.Error("Failed to subscribe to topics", err, zap.Strings("topics", topics)) // Correct signature
 						// Assume connection is broken, trigger reconnect
-						currentSubConn.Close()
+						if errClose := currentSubConn.Close(); errClose != nil {
+							log.Error("Error closing pubsub connection after failed subscribe", errClose) // Correct signature
+						}
 						currentSubConn = nil
 						msgCh = nil
 					}
@@ -434,9 +439,11 @@ func (ws *WsServer) managePubSubConnection() {
 					log.Debug("Processing unsubscribe request", zap.Strings("topics", topics))
 					err := currentSubConn.Unsubscribe(ws.ctx, topics...)
 					if err != nil {
-						log.Error("Failed to unsubscribe from topics", err, zap.Strings("topics", topics))
+						log.Error("Failed to unsubscribe from topics", err, zap.Strings("topics", topics)) // Correct signature
 						// Assume connection is broken, trigger reconnect
-						currentSubConn.Close()
+						if errClose := currentSubConn.Close(); errClose != nil {
+							log.Error("Error closing pubsub connection after failed unsubscribe", errClose) // Correct signature
+						}
 						currentSubConn = nil
 						msgCh = nil
 					}

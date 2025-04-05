@@ -57,9 +57,13 @@ func LoadConfig(configPath string) Config {
 	if err != nil {
 		log.Fatalf("open config file error: %v\n", err)
 	}
-	defer configFile.Close()
+	defer func() {
+		if err := configFile.Close(); err != nil {
+			log.Printf("Error closing config file %s: %v\n", configPath, err)
+		}
+	}()
 
-	var config Config = defaultConfig
+	var config = defaultConfig
 	parser := yaml.NewDecoder(configFile)
 	err = parser.Decode(&config)
 	if err != nil {

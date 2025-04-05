@@ -104,7 +104,11 @@ func (s *fluentBitTCPSink) sendData(doneC chan<- struct{}) {
 			Error("new tcp conn error", err)
 			goto DONE
 		}
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				Error("Error closing fluentbit tcp connection", err)
+			}
+		}()
 		// Check server close wait
 		// In go 1.7+, zero byte reads return immediately and will never return an error.
 		// You must read at least one byte.

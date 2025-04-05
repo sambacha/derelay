@@ -14,6 +14,7 @@ import (
 	"github.com/RabbyHub/derelay/metrics"
 	"github.com/RabbyHub/derelay/relay"
 	"github.com/gorilla/mux"
+	"github.com/redis/go-redis/v9" // Import redis client
 )
 
 func startMetricServer(config *config.MetricConfig) {
@@ -43,7 +44,9 @@ func startMetricServer(config *config.MetricConfig) {
 	}
 
 	go func() {
-		s.ListenAndServe()
+		if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Metric server ListenAndServe error: %v", err)
+		}
 	}()
 }
 
@@ -78,7 +81,16 @@ func main() {
 
 	config := parseCmdlineAndLoadConfig()
 
-	wsServer := relay.NewWSServer(&config)
+	// Create Redis client
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     config.RedisServerConfig.ServerAddr,
+		Password: config.RedisServerConfig.Password, // Assuming Password field exists in RedisConfig
+		DB:       0,                                 // Assuming DB 0
+	})
+	// TODO: Add ping check for redisClient connection?
+
+	// Inject dependencies into WSServer
+	wsServer := relay.NewWSServer(&config.WsServerConfig, &config.RedisServerConfig, redisClient)
 	relayServer := relay.NewRelayServer(&config.RelayServerConfig, wsServer)
 
 	// start websocket server

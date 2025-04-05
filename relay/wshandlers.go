@@ -137,7 +137,7 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 	// Ensure stream and group exist (ignore errors if they already do) with timeout
 	ctxStreamSetup, cancelStreamSetup := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond) // Use state update timeout
 	defer cancelStreamSetup()
-	ws.redisConn.XGroupCreateMkStream(ctxStreamSetup, streamKey, groupName, "0").Result() // Ignore error
+	_, _ = ws.redisConn.XGroupCreateMkStream(ctxStreamSetup, streamKey, groupName, "0").Result() // Explicitly ignore error
 
 	pendingMessages := 0
 	processedIDs := []string{} // Keep track of IDs to ACK

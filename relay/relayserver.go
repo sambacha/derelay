@@ -22,7 +22,9 @@ func NewRelayServer(config *config.RelayConfig, wsServer *WsServer) *relayServer
 
 	r.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("pong"))
+		if _, err := w.Write([]byte("pong")); err != nil {
+			log.Error("Error writing ping response", err)
+		}
 	})
 
 	// handle websocket connection
