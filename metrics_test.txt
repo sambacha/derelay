@@ -1,0 +1,88 @@
+package metrics_test // Change package back to _test
+
+import (
+	// "strings" // Removed unused import
+	"testing"
+
+	"github.com/RabbyHub/derelay/metrics" // Import the package under test
+	"github.com/matryer/is"
+	"github.com/prometheus/client_golang/prometheus" // Import prometheus directly for default registry
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	// Removed promlint import
+)
+
+func TestMetricsCounters(t *testing.T) {
+	is := is.New(t)
+
+	// Reset metrics (assuming they are global)
+	// Ideally, we'd create a new registry for testing, but work with globals for now.
+	// This might require exposing a reset function or careful test ordering.
+	// For simplicity, we test increments from the current state.
+
+	// Get initial values (or assume zero if we could reset) - Use Exported variables
+	initialConns := testutil.ToFloat64(metrics.CurrentConnections) // Use Exported names
+	initialNew := testutil.ToFloat64(metrics.NewConnections)
+	initialClosed := testutil.ToFloat64(metrics.ClosedConnections)
+	initialMsgRecv := testutil.ToFloat64(metrics.MessagesReceived)
+	initialMsgSent := testutil.ToFloat64(metrics.MessagesSent)
+	initialCached := testutil.ToFloat64(metrics.CachedMessages)
+	initialNewSess := testutil.ToFloat64(metrics.NewRequestedSessions)
+	initialRecvSess := testutil.ToFloat64(metrics.ReceivedSessions)
+	initialEstSess := testutil.ToFloat64(metrics.EstablishedSessions)
+
+	// Test connection metrics - Use exported functions
+	metrics.IncNewConnection()        // Use Exported func
+	metrics.SetCurrentConnections(10) // Use Exported func
+
+	is.Equal(testutil.ToFloat64(metrics.NewConnections), initialNew+1)    // Use Exported var
+	is.Equal(testutil.ToFloat64(metrics.CurrentConnections), float64(10)) // Use Exported var
+
+	metrics.IncClosedConnection()                                            // Use Exported func
+	is.Equal(testutil.ToFloat64(metrics.ClosedConnections), initialClosed+1) // Use Exported var
+
+	// Test message metrics - Use exported functions
+	metrics.IncMessagesReceived()      // Use Exported func (renamed from IncTotalMessages)
+	metrics.IncMessagesSentFromCache() // Use Exported func (renamed from DecCachedMessages)
+	metrics.IncCachedMessages()        // Use Exported func
+
+	is.Equal(testutil.ToFloat64(metrics.MessagesReceived), initialMsgRecv+1) // Use Exported var
+	is.Equal(testutil.ToFloat64(metrics.MessagesSent), initialMsgSent+1)     // Use Exported var (check total sent)
+	is.Equal(testutil.ToFloat64(metrics.CachedMessages), initialCached+1)    // Use Exported var
+
+	// Test session metrics - Use exported functions
+	metrics.IncNewRequestedSessions() // Use Exported func
+	metrics.IncReceivedSessions()     // Use Exported func
+	metrics.IncEstablishedSessions()  // Use Exported func
+
+	is.Equal(testutil.ToFloat64(metrics.NewRequestedSessions), initialNewSess+1) // Use Exported var
+	is.Equal(testutil.ToFloat64(metrics.ReceivedSessions), initialRecvSess+1)    // Use Exported var
+	is.Equal(testutil.ToFloat64(metrics.EstablishedSessions), initialEstSess+1)  // Use Exported var
+}
+
+// Test helper functions if any exist and contain logic
+
+// Test metric registration and exposition (more of an integration test)
+// Requires setting up a test HTTP server with the Prometheus handler.
+func TestMetricsExposition(t *testing.T) {
+	is := is.New(t)
+
+	// This test is basic and just checks if some known metrics appear in the output.
+	// A full test would involve parsing the output more rigorously.
+	metrics.IncNewConnection() // Ensure at least one metric has changed
+
+	// Use the default registerer which implements Collector
+	// Correctly handle the two return values from CollectAndLint
+	problems, err := testutil.CollectAndLint(prometheus.DefaultRegisterer)
+	is.NoErr(err)              // Check for collection errors
+	is.Equal(len(problems), 0) // Check for lint problems
+
+	// Optional: More robust check by actually scraping metrics if needed
+	// handler := metrics.Handler() // Get the exported handler
+	// rr := httptest.NewRecorder()
+	// req, _ := http.NewRequest("GET", "/metrics", nil)
+	// handler.ServeHTTP(rr, req)
+	// is.Equal(rr.Code, http.StatusOK)
+	// body := rr.Body.String()
+	// is.True(strings.Contains(body, "derelay_current_connections"))
+	// is.True(strings.Contains(body, "derelay_new_connections_total"))
+}

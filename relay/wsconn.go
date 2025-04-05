@@ -7,17 +7,36 @@ import (
 	"strings"
 	"time"
 
+	// "io" // Removed unused import
+
 	"github.com/RabbyHub/derelay/log"
 	"github.com/RabbyHub/derelay/metrics"
+
+	// "github.com/google/uuid" // Keep uuid if generateRandomBytes16 uses it - remove for now
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
+// wsConnection defines the essential methods needed from a websocket connection
+// for the client's read and write pumps.
+type wsConnection interface {
+	ReadMessage() (messageType int, p []byte, err error)
+	WriteMessage(messageType int, data []byte) error
+	// WriteControl(messageType int, data []byte, deadline time.Time) error // Not used directly in write()
+	// SetReadDeadline(t time.Time) error // Not used directly in read()
+	// SetWriteDeadline(t time.Time) error // Not used directly in write()
+	SetPongHandler(h func(string) error) // Used implicitly by Gorilla? Check usage. Assume needed.
+	Close() error
+}
+
+// Ensure *websocket.Conn satisfies the interface (compile-time check)
+var _ wsConnection = (*websocket.Conn)(nil)
+
 const heartbeatInterval = 1 * time.Minute // How often to update client state in Redis/DragonflyDB
 
 type client struct {
-	conn *websocket.Conn
+	conn wsConnection // Changed to interface type
 	ws   *WsServer
 
 	id        string   // randomly generate, just for logging

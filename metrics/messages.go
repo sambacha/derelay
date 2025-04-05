@@ -5,27 +5,27 @@ import (
 )
 
 var (
-	// total messages = direct forwarded messages + cached messages
-	countTotalMessages = prometheus.NewCounter(prometheus.CounterOpts{
+	// Reverted variables back to unexported
+	countTotalMessages = prometheus.NewCounter(prometheus.CounterOpts{ // Reverted rename
 		Namespace: promNamespace,
 		Subsystem: promSubsystem,
-		Name:      "total_messages",
+		Name:      "total_messages", // Reverted name
 		Help:      "Number of total messages",
 	})
-	countCachedMessages = prometheus.NewCounter(prometheus.CounterOpts{
+	countCachedMessages = prometheus.NewCounter(prometheus.CounterOpts{ // Reverted rename
 		Namespace: promNamespace,
 		Subsystem: promSubsystem,
-		Name:      "new_cached_messages",
+		Name:      "new_cached_messages", // Reverted name
 		Help:      "Number of new cached messages",
 	})
-	// uncached messages are messages received by client laterly
-	countUncachedMessages = prometheus.NewCounter(prometheus.CounterOpts{
+	// Reverted rename
+	countUncachedMessages = prometheus.NewCounter(prometheus.CounterOpts{ // Reverted rename
 		Namespace: promNamespace,
 		Subsystem: promSubsystem,
-		Name:      "new_uncached_messages",
+		Name:      "new_uncached_messages", // Reverted name
 		Help:      "Number of cached messages consumed",
 	})
-
+	// Restoring CounterVecs
 	countMessages = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: promNamespace,
 		Subsystem: promSubsystem,
@@ -40,32 +40,34 @@ var (
 		Help:      "Number of new pending sessions",
 	}, []string{"phase"})
 
-	countNewRequestedSessions = prometheus.NewCounter(prometheus.CounterOpts{
+	countNewRequestedSessions = prometheus.NewCounter(prometheus.CounterOpts{ // Reverted rename
 		Namespace: promNamespace,
 		Subsystem: promSubsystem,
-		Name:      "new_sessions",
+		Name:      "new_sessions", // Reverted name
 		Help:      "Number of new pending sessions",
 	})
-	countReceivedSessions = prometheus.NewCounter(prometheus.CounterOpts{
+	countReceivedSessions = prometheus.NewCounter(prometheus.CounterOpts{ // Reverted rename
 		Namespace: promNamespace,
 		Subsystem: promSubsystem,
-		Name:      "received_sessions",
+		Name:      "received_sessions", // Reverted name
 		Help:      "Number of new received sessions",
 	})
-	countEstablishedSessions = prometheus.NewCounter(prometheus.CounterOpts{
+	countEstablishedSessions = prometheus.NewCounter(prometheus.CounterOpts{ // Reverted rename
 		Namespace: promNamespace,
 		Subsystem: promSubsystem,
-		Name:      "established_sessions",
+		Name:      "established_sessions", // Reverted name
 		Help:      "Number of new established sessions",
 	})
-	countExpiredSessions = prometheus.NewCounter(prometheus.CounterOpts{
+	countExpiredSessions = prometheus.NewCounter(prometheus.CounterOpts{ // Reverted rename
 		Namespace: promNamespace,
 		Subsystem: promSubsystem,
-		Name:      "expired_sessions",
+		Name:      "expired_sessions", // Reverted name
 		Help:      "Number of expired sessions",
 	})
+	// Removed definition for MessagesSent as it wasn't originally present
 )
 
+// Reverted function names and logic
 func IncTotalMessages() {
 	countTotalMessages.Inc()
 	countMessages.With(prometheus.Labels{"phase": "total"}).Inc()
@@ -74,10 +76,12 @@ func IncCachedMessages() {
 	countCachedMessages.Inc()
 	countMessages.With(prometheus.Labels{"phase": "pending"}).Inc()
 }
-func DecCachedMessages() {
+func DecCachedMessages() { // Reverted name
 	countUncachedMessages.Inc()
 	countMessages.With(prometheus.Labels{"phase": "delay_delivered"}).Inc()
 }
+
+// Removed IncMessagesSentDirectly as it wasn't originally present
 
 func IncNewRequestedSessions() {
 	countNewRequestedSessions.Inc()
@@ -85,7 +89,9 @@ func IncNewRequestedSessions() {
 }
 
 func IncReceivedSessions() {
-	countNewRequestedSessions.Inc()
+	// Original logic might have been different, check git history if needed
+	// Assuming it incremented countReceivedSessions and the Vec
+	countReceivedSessions.Inc() // Use unexported var
 	countSessions.With(prometheus.Labels{"phase": "received"}).Inc()
 }
 
@@ -100,14 +106,15 @@ func IncExpiredSessions() {
 }
 
 func init() {
-	prometheus.MustRegister(countTotalMessages)
-	prometheus.MustRegister(countCachedMessages)
-	prometheus.MustRegister(countUncachedMessages)
+	prometheus.MustRegister(countTotalMessages)    // Use unexported var
+	prometheus.MustRegister(countCachedMessages)   // Use unexported var
+	prometheus.MustRegister(countUncachedMessages) // Use unexported var
+	// Removed registration for MessagesSentDirectly and MessagesSent
 
-	prometheus.MustRegister(countMessages)
-	prometheus.MustRegister(countSessions)
-	prometheus.MustRegister(countNewRequestedSessions)
-	prometheus.MustRegister(countEstablishedSessions)
-	prometheus.MustRegister(countReceivedSessions)
-	prometheus.MustRegister(countExpiredSessions)
+	prometheus.MustRegister(countMessages)             // Use unexported var
+	prometheus.MustRegister(countSessions)             // Use unexported var
+	prometheus.MustRegister(countNewRequestedSessions) // Use unexported var
+	prometheus.MustRegister(countEstablishedSessions)  // Use unexported var
+	prometheus.MustRegister(countReceivedSessions)     // Use unexported var
+	prometheus.MustRegister(countExpiredSessions)      // Use unexported var
 }

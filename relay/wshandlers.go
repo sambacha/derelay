@@ -45,7 +45,7 @@ func (ws *WsServer) pubMessage(message SocketMessage) {
 
 	log.Debug("publish message", zap.Any("client", publisher), zap.Any("topic", message.Topic))
 
-	metrics.IncTotalMessages()
+	metrics.IncTotalMessages() // Reverted rename
 	key := messageChanKey(topic)
 	// Publish message using the main redis connection with timeout
 	ctxPub, cancelPub := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.PublishTimeoutMs)*time.Millisecond)
@@ -60,11 +60,13 @@ func (ws *WsServer) pubMessage(message SocketMessage) {
 				Role:  string(Wallet),
 			})
 		}
+		// Removed IncMessagesSentDirectly call
 	} else {
+		// Publish failed (no subscribers), cache it
 		log.Debug("cache message", zap.Any("client", publisher), zap.Any("topic", topic))
 		metrics.IncCachedMessages()
 		if message.Phase == string(SessionRequest) {
-			metrics.IncNewRequestedSessions()
+			metrics.IncNewRequestedSessions() // Still increment requested here
 		}
 		// Cache message using XADD to the stream
 		streamKey := streamMessageKey(topic)
@@ -195,8 +197,9 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 			if subscriber.role != Dapp && notification.Phase == string(SessionRequest) {
 				// When a wallet subscribes to a topic, either it've just scanned the QRCode to receive the session request
 				// or it've just waken up from hibernation and trying to recovering the connection
+
 				// This handles the first case (scanning QR code and finding the request in the stream)
-				metrics.IncReceivedSessions()
+				metrics.IncReceivedSessions() // Keep this as it exists
 				log.Debug("session request received from stream", zap.Any("topic", topic), zap.Any("client", subscriber))
 
 				// notify the topic publisher, aka the dapp, that the session request has been received by wallet
@@ -229,12 +232,13 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 
 	// Wallet-specific logic for SessionResumed (always send on subscribe if wallet)
 	// This handles the case where a wallet reconnects (wakes up from hibernation)
+	// We always notify DApp of resume, regardless of pending messages found
 	if subscriber.role != Dapp {
-		// NOTE we could check for whether the notifications of this topic is session request, we don't need reply `sessionResumed`
-		// for sessionRequest message, but for simplity we don't do that check here
+		log.Debug("wallet subscribed, publishing session resumed notification", zap.String("topic", topic), zap.Any("client", subscriber))
 		dappNotifyKey := dappNotifyChanKey(message.Topic)
 		ctxPubResumed, cancelPubResumed := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.PublishTimeoutMs)*time.Millisecond)
-		ws.redisConn.Publish(ctxPubResumed, dappNotifyKey, SocketMessage{ // Use ctxPubResumed
+		// Corrected: Publish returns only *redis.IntCmd
+		_ = ws.redisConn.Publish(ctxPubResumed, dappNotifyKey, SocketMessage{ // Use ctxPubResumed
 			Topic: message.Topic,
 			Type:  Pub, // Send Pub type for SessionResumed notification
 			Role:  string(Relay),

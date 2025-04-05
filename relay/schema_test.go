@@ -109,3 +109,61 @@ func TestTopicGet(t *testing.T) {
 		t.Errorf("key does not exists")
 	}
 }
+
+func TestTopicClientSetClear(t *testing.T) {
+	ts := NewTopicClientSet()
+
+	c1 := &client{id: "1"}
+	c2 := &client{id: "2"}
+	topic1 := "topic1"
+	topic2 := "topic2"
+
+	ts.Set(topic1, c1)
+	ts.Set(topic1, c2)
+	ts.Set(topic2, c1)
+
+	if ts.Len(topic1) != 2 {
+		t.Errorf("Expected length 2 for topic1, got %d", ts.Len(topic1))
+	}
+	if ts.Len(topic2) != 1 {
+		t.Errorf("Expected length 1 for topic2, got %d", ts.Len(topic2))
+	}
+
+	ts.Clear(topic1)
+
+	if ts.Len(topic1) != 0 {
+		t.Errorf("Expected length 0 for topic1 after clear, got %d", ts.Len(topic1))
+	}
+	if _, ok := ts.Data[topic1]; ok {
+		t.Errorf("Topic1 key should not exist after clear")
+	}
+	// Ensure topic2 is unaffected
+	if ts.Len(topic2) != 1 {
+		t.Errorf("Expected length 1 for topic2 after clearing topic1, got %d", ts.Len(topic2))
+	}
+	if len(ts.GetTopicsByClient(c1, false)) != 1 {
+		t.Errorf("Client c1 should only be associated with topic2 now")
+	}
+}
+
+func TestTopicClientSetEmpty(t *testing.T) {
+	ts := NewTopicClientSet()
+	c1 := &client{id: "1"}
+	topic := "empty_topic"
+
+	if ts.Len(topic) != 0 {
+		t.Errorf("Expected length 0 for non-existent topic, got %d", ts.Len(topic))
+	}
+	if len(ts.Get(topic)) != 0 {
+		t.Errorf("Expected empty map for non-existent topic get")
+	}
+	if len(ts.GetTopicsByClient(c1, false)) != 0 {
+		t.Errorf("Expected empty topic list for client not in set")
+	}
+	ts.Unset(topic, c1) // Should not panic
+	ts.Clear(topic)     // Should not panic
+}
+
+// Note: Concurrency tests would require running Set/Unset/Get/Len/Clear
+// from multiple goroutines and checking for race conditions using `go test -race`.
+// This basic test suite doesn't include explicit concurrency tests.

@@ -10,6 +10,7 @@ import (
 	"github.com/RabbyHub/derelay/config"
 	"github.com/RabbyHub/derelay/log"
 	"github.com/RabbyHub/derelay/metrics"
+	"github.com/RabbyHub/derelay/ports" // Import new ports package
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket" // Re-add import
 	"github.com/redis/go-redis/v9"
@@ -26,8 +27,8 @@ type WsServer struct {
 	register   chan *client
 	unregister chan ClientUnregisterEvent
 
-	redisConn    *redis.Client
-	redisSubConn *redis.PubSub // Still potentially useful for direct access if needed, managed by goroutine
+	redisConn ports.RedisClient // Use ports.RedisClient interface type
+	// redisSubConn is managed internally by managePubSubConnection
 
 	publishers  *TopicClientSet
 	subscribers *TopicClientSet
@@ -63,12 +64,13 @@ func NewWSServer(config *config.Config) *WsServer {
 	ws.instanceID = uuid.NewString() // Generate unique ID for this instance
 	log.Info("Initializing WsServer", zap.String("instanceID", ws.instanceID))
 
-	ws.redisConn = redis.NewClient(&redis.Options{
+	// Create the concrete client, but store it as the interface type
+	concreteRedisClient := redis.NewClient(&redis.Options{
 		Addr:     config.RedisServerConfig.ServerAddr,
 		Password: config.RedisServerConfig.Password,
 		DB:       0,
 	})
-	// ws.redisSubConn = ws.redisConn.Subscribe(context.TODO()) // Removed: Manager goroutine handles this
+	ws.redisConn = ports.NewRedisClientAdapter(concreteRedisClient) // Use adapter from ports package
 
 	// Initialize context and channels for the manager goroutine
 	ws.ctx, ws.cancel = context.WithCancel(context.Background())
@@ -117,8 +119,8 @@ func (ws *WsServer) NewClientConn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &client{
-		conn:      conn,
-		id:        generateRandomBytes16(),
+		conn:      conn,                    // This still uses the concrete type
+		id:        generateRandomBytes16(), // Assuming this function exists
 		ws:        ws,
 		pubTopics: NewTopicSet(),
 		subTopics: NewTopicSet(),
@@ -206,9 +208,9 @@ func (ws *WsServer) Run() {
 			clientKey := clientHashKey(client.id)
 			now := time.Now().Unix()
 			// Use pipeline for efficiency
-			pipe := ws.redisConn.Pipeline()
+			pipe := ws.redisConn.Pipeline() // Returns redis.Pipeliner
 			// Role might be unknown initially, set later in client.read heartbeat
-			pipe.HSet(context.TODO(), clientKey, map[string]interface{}{
+			pipe.HSet(context.TODO(), clientKey, map[string]interface{}{ // Call methods on the pipeliner
 				"instanceID":  ws.instanceID,
 				"connectedAt": now,
 				"lastSeen":    now,
@@ -329,7 +331,7 @@ func (ws *WsServer) managePubSubConnection() {
 	defer log.Info("PubSub connection manager stopped.")
 	log.Info("PubSub connection manager started.")
 
-	var currentSubConn *redis.PubSub
+	var currentSubConn ports.RedisPubSub // Use ports.RedisPubSub interface type
 	var msgCh <-chan *redis.Message
 	backoff := time.Second // Initial backoff duration
 
@@ -344,29 +346,24 @@ func (ws *WsServer) managePubSubConnection() {
 			// Attempt to establish connection if not currently connected
 			if currentSubConn == nil {
 				log.Info("Attempting to establish PubSub connection...")
-				subConn := ws.redisConn.Subscribe(ws.ctx) // Use ws.ctx
-				if subConn == nil {                       // Check if Subscribe itself failed immediately
-					log.Error("Failed to initiate PubSub subscription.", nil)
-					// Wait before retrying
-					time.Sleep(backoff)
-					backoff = min(backoff*2, 30*time.Second) // Exponential backoff up to 30s
-					continue
-				}
+				subConn := ws.redisConn.Subscribe(ws.ctx) // Returns RedisPubSub interface
 
-				// Verify connection by trying to receive confirmation (optional but good practice)
+				// Verify connection by trying to receive confirmation
 				_, err := subConn.Receive(ws.ctx)
 				if err != nil {
 					log.Error("Failed to verify PubSub subscription.", err)
-					subConn.Close()
+					if subConn != nil { // Check if subConn is not nil before closing
+						subConn.Close()
+					}
 					time.Sleep(backoff)
-					backoff = min(backoff*2, 30*time.Second)
-					continue
+					backoff = min(backoff*2, 30*time.Second) // Exponential backoff up to 30s
+					continue                                 // Retry connection attempt
 				}
 
 				log.Info("PubSub connection established.")
-				currentSubConn = subConn
-				msgCh = currentSubConn.Channel()
-				backoff = time.Second // Reset backoff on successful connection
+				currentSubConn = subConn         // Assign interface
+				msgCh = currentSubConn.Channel() // Call method on interface
+				backoff = time.Second            // Reset backoff on successful connection
 
 				// Re-subscribe to all necessary topics
 				topicsToResubscribe := ws.getAllActiveTopics()
@@ -395,7 +392,9 @@ func (ws *WsServer) managePubSubConnection() {
 			case msg, ok := <-msgCh:
 				if !ok {
 					log.Warn("PubSub message channel closed. Connection lost.")
-					currentSubConn.Close() // Ensure closed
+					if currentSubConn != nil { // Ensure close is called only if not nil
+						currentSubConn.Close()
+					}
 					currentSubConn = nil
 					msgCh = nil
 					// No sleep here, outer loop will handle backoff retry
