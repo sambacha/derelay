@@ -9,7 +9,8 @@ services:
       - "--config"
       - "/config/config.yaml"
     volumes:
-      - ./example/example-config.yaml:/config/config.yaml
+      # Use the E2E specific config for testing
+      - ./config/e2e-config.yaml:/config/config.yaml
     networks:
       - derelay
     depends_on:

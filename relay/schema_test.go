@@ -1,6 +1,10 @@
 package relay
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+	"testing/quick"
+)
 
 func TestTopicSetBasic(t *testing.T) {
 	ts := NewTopicClientSet()
@@ -107,5 +111,46 @@ func TestTopicGet(t *testing.T) {
 	}
 	if _, ok := topics["hello2"]; !ok {
 		t.Errorf("key does not exists")
+	}
+}
+
+// Property-based test for SocketMessage serialization/deserialization
+func TestSocketMessageMarshalUnmarshalProperty(t *testing.T) {
+	property := func(original SocketMessage) bool {
+		// Marshal the original message
+		data, err := original.MarshalBinary()
+		if err != nil {
+			// If marshaling fails for a generated message, quick.Check treats it as a failure
+			// but we might want specific logging or handling depending on why it could fail.
+			// For now, returning false indicates a problem.
+			t.Logf("MarshalBinary failed for input %v: %v", original, err)
+			return false
+		}
+
+		// Unmarshal back into a new message
+		var reconstructed SocketMessage
+		err = json.Unmarshal(data, &reconstructed)
+		if err != nil {
+			t.Logf("Unmarshal failed for data %s: %v", string(data), err)
+			return false
+		}
+
+		// Compare the exported fields. We ignore the unexported 'client' field.
+		return original.Topic == reconstructed.Topic &&
+			original.Type == reconstructed.Type &&
+			original.Payload == reconstructed.Payload &&
+			original.Role == reconstructed.Role &&
+			original.Phase == reconstructed.Phase &&
+			original.Silent == reconstructed.Silent
+	}
+
+	// Configure quick.Check if needed (e.g., number of iterations)
+	config := &quick.Config{
+		// Values: func(values []reflect.Value, rand *rand.Rand) {}, // Custom generator hook if needed
+		// MaxCount: 1000, // Increase iterations if desired
+	}
+
+	if err := quick.Check(property, config); err != nil {
+		t.Errorf("SocketMessage marshal/unmarshal property failed: %v", err)
 	}
 }

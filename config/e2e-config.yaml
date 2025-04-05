@@ -1,0 +1,11 @@
+redis_config:
+  server_addr: redis:6379 # Use Docker Compose service name
+  # password: "" # Optional password
+  # Timeouts for Redis/DragonflyDB operations in milliseconds
+  # heartbeat_timeout_ms: 1000
+  # state_update_timeout_ms: 2000
+  # cache_write_timeout_ms: 2000
+  # stream_read_timeout_ms: 3000
+  # publish_timeout_ms: 2000
+metric_config:
+  enabled: true

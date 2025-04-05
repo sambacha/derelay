@@ -101,7 +101,11 @@ func (ws *WsServer) NewClientConn(w http.ResponseWriter, r *http.Request) {
 					return true
 				}
 			}
-			log.Warn("WebSocket origin denied", zap.String("origin", origin), zap.Strings("allowed", ws.config.AllowedOrigins))
+			log.Warn(
+				"WebSocket origin denied",
+				zap.String("origin", origin),
+				zap.Strings("allowed", ws.config.AllowedOrigins),
+			)
 			return false
 		},
 		// Add other upgrader options if needed (ReadBufferSize, WriteBufferSize)
@@ -111,7 +115,12 @@ func (ws *WsServer) NewClientConn(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Log upgrade errors for debugging, but don't flood logs for non-websocket requests
 		// Check for specific websocket handshake errors if possible
-		log.Debug("WebSocket upgrade failed", zap.Error(err), zap.String("remoteAddr", r.RemoteAddr), zap.String("origin", r.Header.Get("Origin")))
+		log.Debug(
+			"WebSocket upgrade failed",
+			zap.Error(err),
+			zap.String("remoteAddr", r.RemoteAddr),
+			zap.String("origin", r.Header.Get("Origin")),
+		)
 		// Return directly without sending an HTTP error response, as Upgrade handles that.
 		return
 	}
@@ -171,7 +180,11 @@ func (ws *WsServer) Run() {
 				// Pong messages are responses to Pings, usually handled by the client, not server processing.
 				log.Warn("Received unexpected Pong message on local channel", zap.Any("message", message))
 			default:
-				log.Warn("Received unknown message type on local channel", zap.String("type", string(message.Type)), zap.Any("message", message))
+				log.Warn(
+					"Received unknown message type on local channel",
+					zap.String("type", string(message.Type)),
+					zap.Any("message", message),
+				)
 			}
 		// Receive messages from the PubSub manager goroutine
 		case msg := <-ws.remoteMessages:
@@ -184,12 +197,20 @@ func (ws *WsServer) Run() {
 				log.Warn("malformed message from remote", zap.String("payload", msg.Payload), zap.Error(err))
 				continue
 			}
-			log.Debug("remote message received", zap.Any("message", message), zap.String("channel", msg.Channel)) // Log channel too
+			log.Debug(
+				"remote message received",
+				zap.Any("message", message),
+				zap.String("channel", msg.Channel),
+			) // Log channel too
 
 			// if message is not from `dappNotifyChan`, then must be from `messageChan` and must be a "pub" message
 			if !fromDappNotifyChan(msg.Channel) { // Check msg.Channel
 				for _, subscriber := range ws.GetSubscriber(message.Topic) {
-					log.Debug("forwarding remote pub to subscriber", zap.Any("client", subscriber), zap.Any("message", message))
+					log.Debug(
+						"forwarding remote pub to subscriber",
+						zap.Any("client", subscriber),
+						zap.Any("message", message),
+					)
 					subscriber.send(message) // Forward the unmarshaled SocketMessage
 				}
 				continue

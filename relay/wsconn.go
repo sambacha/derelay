@@ -60,7 +60,12 @@ func (c *client) read() {
 		message := SocketMessage{}
 		// Use '=' to avoid shadowing outer 'err'
 		if err = json.NewDecoder(bytes.NewReader(m)).Decode(&message); err != nil {
-			log.Warn("[wsconn] received malformed text message", zap.Error(err), zap.String("raw", string(m)), zap.Any("client", c))
+			log.Warn(
+				"[wsconn] received malformed text message",
+				zap.Error(err),
+				zap.String("raw", string(m)),
+				zap.Any("client", c),
+			)
 			continue // Skip malformed message
 		}
 
@@ -81,7 +86,10 @@ func (c *client) read() {
 		// Periodic heartbeat update to Redis/DragonflyDB
 		if time.Since(c.lastHeartbeat) > heartbeatInterval || roleUpdated {
 			// Correctly access redisConfig from WsServer
-			ctxHeartbeat, cancelHB := context.WithTimeout(c.ws.ctx, time.Duration(c.ws.redisConfig.HeartbeatTimeoutMs)*time.Millisecond)
+			ctxHeartbeat, cancelHB := context.WithTimeout(
+				c.ws.ctx,
+				time.Duration(c.ws.redisConfig.HeartbeatTimeoutMs)*time.Millisecond,
+			)
 			defer cancelHB()
 
 			pipe := c.ws.redisConn.Pipeline()
