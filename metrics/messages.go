@@ -85,7 +85,7 @@ func IncNewRequestedSessions() {
 }
 
 func IncReceivedSessions() {
-	countNewRequestedSessions.Inc()
+	countReceivedSessions.Inc() // Corrected counter
 	countSessions.With(prometheus.Labels{"phase": "received"}).Inc()
 }
 

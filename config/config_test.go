@@ -1,7 +1,6 @@
 package config_test
 
 import (
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -20,11 +19,11 @@ func TestConfigOverwritten(t *testing.T) {
 	expectedConfig.WsServerConfig.AllowedOrigins = []string{"debank.com", "ethereum.com"}
 	expectedConfig.RedisServerConfig.ServerAddr = ":654321"
 
-	tmpfile, err := ioutil.TempFile("", "tmpconfig.yml")
+	tmpfile, err := os.CreateTemp("", "tmpconfig*.yml")
 	if err != nil {
 		panic(err)
 	}
-	defer os.Remove(tmpfile.Name())
+	defer func() { _ = os.Remove(tmpfile.Name()) }()
 
 	if err := yaml.NewEncoder(tmpfile).Encode(expectedConfig); err != nil {
 		panic(err)
@@ -52,11 +51,11 @@ redis_config:
 	expectedConfig.WsServerConfig.AllowedOrigins = []string{"debank.com", "ethereum.com"}
 	expectedConfig.RedisServerConfig.ServerAddr = ":654321"
 
-	tmpfile, err := ioutil.TempFile("", "tmpconfig.yml")
+	tmpfile, err := os.CreateTemp("", "tmpconfig*.yml")
 	if err != nil {
 		panic(err)
 	}
-	defer os.Remove(tmpfile.Name())
+	defer func() { _ = os.Remove(tmpfile.Name()) }()
 
 	if _, err := tmpfile.WriteString(raw); err != nil {
 		panic(err)

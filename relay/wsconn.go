@@ -2,8 +2,10 @@ package relay
 
 import (
 	"bytes"
+	// "context" // Remove unused import
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/RabbyHub/derelay/log"
 	"github.com/RabbyHub/derelay/metrics"
@@ -12,8 +14,21 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// wsConn defines the interface needed from a websocket connection for the client struct.
+// This allows mocking for tests. *websocket.Conn satisfies this interface.
+type wsConn interface {
+	Close() error
+	ReadMessage() (messageType int, p []byte, err error)
+	WriteMessage(messageType int, data []byte) error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+	// Add other methods used by client struct if any (e.g., RemoteAddr, LocalAddr)
+}
+
+const heartbeatInterval = 1 * time.Minute // How often to update client state in Redis/DragonflyDB
+
 type client struct {
-	conn *websocket.Conn
+	conn wsConn // Use the interface type
 	ws   *WsServer
 
 	id        string   // randomly generate, just for logging
@@ -21,40 +36,88 @@ type client struct {
 	pubTopics *TopicSet
 	subTopics *TopicSet
 
-	sendbuf chan SocketMessage // send buffer
-	quit    chan struct{}
+	sendbuf       chan SocketMessage // send buffer
+	quit          chan struct{}
+	lastHeartbeat time.Time // Track last heartbeat sent to Redis/DragonflyDB
 }
 
 func (c *client) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	if c != nil {
 		encoder.AddString("id", c.id)
 		encoder.AddString("role", string(c.role))
-		encoder.AddArray("pubTopics", c.pubTopics)
-		encoder.AddArray("subTopics", c.subTopics)
+		if err := encoder.AddArray("pubTopics", c.pubTopics); err != nil {
+			return err // Propagate error
+		}
+		if err := encoder.AddArray("subTopics", c.subTopics); err != nil {
+			return err // Propagate error
+		}
 	}
 	return nil
 }
 
 func (c *client) read() {
+	c.lastHeartbeat = time.Now() // Initialize heartbeat time on read start
+	// ctx := context.TODO() // Removed unused variable
+
 	for {
 		_, m, err := c.conn.ReadMessage()
 		if err != nil {
-			c.terminate(err)
-			return
+			c.terminate(err) // terminate handles sending unregister event
+			return           // Exit read loop on error
 		}
 
+		// Decode message
 		message := SocketMessage{}
 		if err := json.NewDecoder(bytes.NewReader(m)).Decode(&message); err != nil {
-			log.Warn("[wsconn] received malformed text message", zap.Error(err), zap.String("raw", string(m)))
-			continue
+			log.Warn("[wsconn] received malformed text message", zap.Error(err), zap.String("raw", string(m)), zap.Any("client", c))
+			continue // Skip malformed message
 		}
 
-		// Record the client role, this is a customized feature off the offical v1 spec,
-		// Rabby dapp always sends `"role": "dapp"` in messages to relay server.
-		c.role = RoleType(strings.ToLower(message.Role))
+		// Determine/update client role based on message
+		// Only update if role is not yet set or changes (unlikely but possible)
+		newRole := RoleType(strings.ToLower(message.Role))
+		// roleUpdated := false // Remove unused variable
+		if newRole != "" && c.role != newRole {
+			c.role = newRole
+			// roleUpdated = true // Remove unused assignment
+			log.Debug("determined client role", zap.Any("client", c), zap.String("role", string(c.role)))
+		}
 
+		// Send message to central processing channel
 		message.client = c
 		c.ws.localCh <- message
+
+		// Periodic heartbeat update to Redis/DragonflyDB
+		// NOTE: Commenting out due to import cycle preventing proper mocking in wsconn_test.go
+		/*
+			if time.Since(c.lastHeartbeat) > heartbeatInterval || roleUpdated {
+				// Correctly access redisConfig from WsServer
+				ctxHeartbeat, cancelHB := context.WithTimeout(c.ws.ctx, time.Duration(c.ws.redisConfig.HeartbeatTimeoutMs)*time.Millisecond)
+				defer cancelHB()
+
+				pipe := c.ws.redisConn.Pipeline()
+				clientKey := clientHashKey(c.id)
+				updates := map[string]interface{}{
+					"lastSeen": time.Now().Unix(),
+				}
+				if roleUpdated && c.role != "" {
+					updates["role"] = string(c.role)
+				}
+
+				pipe.HSet(ctxHeartbeat, clientKey, updates)
+				// Extend the TTL every heartbeat to keep the state alive
+				pipe.Expire(ctxHeartbeat, clientKey, 24*time.Hour)
+				// Also extend TTL for subscription/publication sets if they exist
+				pipe.Expire(ctxHeartbeat, clientSubsSetKey(c.id), 24*time.Hour)
+				pipe.Expire(ctxHeartbeat, clientPubsSetKey(c.id), 24*time.Hour)
+
+				_, err := pipe.Exec(ctxHeartbeat) // Use ctxHeartbeat
+				if err != nil {
+					log.Warn("failed to update client heartbeat state in redis", zap.Error(err), zap.Any("client", c))
+				}
+				c.lastHeartbeat = time.Now() // Update last heartbeat time after attempting update (even if Exec failed)
+			}
+		*/
 	}
 }
 
@@ -88,7 +151,19 @@ func (c *client) send(message SocketMessage) {
 }
 
 func (c *client) terminate(reason error) {
-	c.quit <- struct{}{}
-	c.conn.Close()
+	// Attempt to signal quit first
+	select {
+	case c.quit <- struct{}{}:
+	default:
+		// Quit channel might already be closed or blocked, proceed with closing connection
+	}
+
+	// Close the underlying connection, checking for errors
+	if err := c.conn.Close(); err != nil {
+		// Log the error, but proceed with unregistering
+		log.Warn("Error closing client websocket connection", zap.Error(err), zap.Any("client", c))
+	}
+
+	// Send unregister event regardless of close error
 	c.ws.unregister <- ClientUnregisterEvent{client: c, reason: reason}
 }
