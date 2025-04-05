@@ -1,14 +1,19 @@
 package relay
 
 import (
-	"crypto/rand"
+	crand "crypto/rand" // Aliased crypto/rand
 	"encoding/base64"
 	"encoding/json"
+	mrand "math/rand" // Aliased math/rand for quick.Generator
+	"reflect"         // Added for quick.Generator
 	"strings"
 	"sync"
+	"testing/quick" // Added for quick.Generator
 
 	"go.uber.org/zap/zapcore"
 )
+
+// MessageType constants...
 
 type MessageType string
 
@@ -33,9 +38,35 @@ type SocketMessage struct {
 	client *client `json:"-"`
 }
 
+// Generate implements the testing/quick.Generator interface for SocketMessage.
+// This allows quick.Check to generate SocketMessage instances, handling the unexported field.
+func (SocketMessage) Generate(rand *mrand.Rand, size int) reflect.Value { // Use aliased mrand.Rand
+	// Use quick.Value to generate values for exported fields based on their types
+	topicVal, _ := quick.Value(reflect.TypeOf(""), rand)             // Pass the mrand.Rand instance
+	typeVal, _ := quick.Value(reflect.TypeOf(MessageType("")), rand) // Pass the mrand.Rand instance
+	payloadVal, _ := quick.Value(reflect.TypeOf(""), rand)           // Pass the mrand.Rand instance
+	roleVal, _ := quick.Value(reflect.TypeOf(""), rand)              // Pass the mrand.Rand instance
+	phaseVal, _ := quick.Value(reflect.TypeOf(""), rand)             // Pass the mrand.Rand instance
+	silentVal, _ := quick.Value(reflect.TypeOf(false), rand)         // Pass the mrand.Rand instance
+
+	// Create the SocketMessage with generated values and nil for the unexported field
+	msg := SocketMessage{
+		Topic:   topicVal.String(),
+		Type:    MessageType(typeVal.String()),
+		Payload: payloadVal.String(),
+		Role:    roleVal.String(),
+		Phase:   phaseVal.String(),
+		Silent:  silentVal.Bool(),
+		client:  nil, // Explicitly set unexported field to nil
+	}
+	return reflect.ValueOf(msg)
+}
+
 func (sm SocketMessage) MarshalBinary() ([]byte, error) {
 	return json.Marshal(sm)
 }
+
+// RoleType constants...
 
 type RoleType string
 
@@ -212,7 +243,7 @@ type ClientUnregisterEvent struct {
 
 func generateRandomBytes16() string {
 	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := crand.Read(buf); err != nil { // Use aliased crand.Read
 		return ""
 	}
 	return base64.StdEncoding.EncodeToString(buf)

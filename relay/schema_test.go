@@ -154,3 +154,37 @@ func TestSocketMessageMarshalUnmarshalProperty(t *testing.T) {
 		t.Errorf("SocketMessage marshal/unmarshal property failed: %v", err)
 	}
 }
+
+// Benchmark for SocketMessage serialization/deserialization
+func BenchmarkSocketMessageMarshalUnmarshal(b *testing.B) {
+	// Create a sample message to use for benchmarking
+	// Using realistic-ish values
+	msg := SocketMessage{
+		Topic:   "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", // 64 hex chars
+		Type:    Pub,
+		Payload: `{"jsonrpc":"2.0","method":"some_method","params":{"data":"0x...","more_data":123},"id":1}`,
+		Role:    string(Dapp),
+		Phase:   string(SessionRequest),
+		Silent:  false,
+	}
+	var data []byte
+	var err error
+
+	b.ReportAllocs() // Report memory allocations
+	b.ResetTimer()   // Start timing after setup
+
+	for i := 0; i < b.N; i++ {
+		// Marshal
+		data, err = msg.MarshalBinary()
+		if err != nil {
+			b.Fatalf("MarshalBinary failed: %v", err)
+		}
+
+		// Unmarshal (into a throwaway variable to simulate the full cycle)
+		var reconstructed SocketMessage
+		err = json.Unmarshal(data, &reconstructed)
+		if err != nil {
+			b.Fatalf("Unmarshal failed: %v", err)
+		}
+	}
+}
