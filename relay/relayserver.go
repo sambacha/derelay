@@ -3,14 +3,17 @@ package relay
 import (
 	"context"
 	"errors"
-	"fmt"
+
+	// "fmt" // Remove unused import
 	"net/http"
 	"time"
 
 	"github.com/RabbyHub/derelay/config"
-	"github.com/RabbyHub/derelay/log"
+	"github.com/RabbyHub/derelay/log" // Add log import
 	"github.com/gorilla/mux"
 )
+
+// Removed duplicate import block
 
 type relayServer struct {
 	httpServer *http.Server
@@ -22,7 +25,7 @@ func NewRelayServer(config *config.RelayConfig, wsServer *WsServer) *relayServer
 
 	r.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("pong"))
+		_, _ = w.Write([]byte("pong")) // Ignore both return values (bytes written, error)
 	})
 
 	// handle websocket connection
@@ -56,9 +59,10 @@ func (rs *relayServer) Run() {
 
 // Shutdown Gracefully shutdown the relay server
 func (rs *relayServer) Shutdown() {
-	err := rs.httpServer.Shutdown(context.TODO())
+	// Use background context for shutdown, or potentially one passed down
+	err := rs.httpServer.Shutdown(context.Background())
 	if err != nil {
-		fmt.Println(err)
+		log.Error("RelayServer HTTP shutdown error", err) // Use project logger
 	}
 	rs.wsServer.Shutdown()
 }

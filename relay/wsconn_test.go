@@ -1,7 +1,7 @@
 package relay
 
 import (
-	"fmt"
+	// "fmt" // Remove unused import
 	"sync"
 	"testing"
 	"time"
@@ -17,9 +17,9 @@ func TestSendChanWithNoReceiver(t *testing.T) {
 		defer wg.Done()
 		for {
 			i := <-send
-			fmt.Printf("received: %v\n", i)
+			t.Logf("received: %v", i) // Use t.Logf
 			if i == 3 {
-				fmt.Printf("receiving routine exit\n")
+				t.Logf("receiving routine exit") // Use t.Logf
 				return
 			}
 		}
@@ -33,11 +33,11 @@ func TestSendChanWithNoReceiver(t *testing.T) {
 		for {
 			select {
 			case send <- i:
-				fmt.Printf("send: %v\n", i)
+				t.Logf("send: %v", i) // Use t.Logf
 				i++
 				time.Sleep(1 * time.Second)
 			default:
-				fmt.Printf("send buffer is full\n")
+				t.Logf("send buffer is full") // Use t.Logf
 				return
 			}
 		}

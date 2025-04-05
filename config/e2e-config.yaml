@@ -1,5 +1,5 @@
 redis_config:
-  server_addr: 127.0.0.1:6379
+  server_addr: redis:6379 # Use Docker Compose service name
   # password: "" # Optional password
   # Timeouts for Redis/DragonflyDB operations in milliseconds
   # heartbeat_timeout_ms: 1000

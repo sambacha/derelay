@@ -34,7 +34,12 @@ var defaultConfig = Config{
 		AllowedOrigins:             []string{"*"},
 	},
 	RedisServerConfig: RedisConfig{
-		ServerAddr: "127.0.0.1:6379",
+		ServerAddr:           "127.0.0.1:6379",
+		HeartbeatTimeoutMs:   1000,
+		StateUpdateTimeoutMs: 2000,
+		CacheWriteTimeoutMs:  2000,
+		StreamReadTimeoutMs:  3000,
+		PublishTimeoutMs:     2000,
 	},
 	MetricServerConfig: MetricConfig{
 		Enable: true,
