@@ -1,8 +1,9 @@
 package main
 
 import (
+	"errors" // Add import for errors.Is
 	"flag"
-	"log"
+	stdLog "log" // Alias standard log to avoid conflict
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RabbyHub/derelay/config"
+	projLog "github.com/RabbyHub/derelay/log" // Use aliased import for project's log
 	"github.com/RabbyHub/derelay/metrics"
 	"github.com/RabbyHub/derelay/relay"
 	"github.com/gorilla/mux"
@@ -43,7 +45,12 @@ func startMetricServer(config *config.MetricConfig) {
 	}
 
 	go func() {
-		s.ListenAndServe()
+		// Check error from ListenAndServe
+		err := s.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Use aliased project logger
+			projLog.Error("Metrics server ListenAndServe error", err)
+		}
 	}()
 }
 
@@ -98,7 +105,8 @@ func main() {
 
 	sig := <-sigChan
 	waitSeconds := config.RelayServerConfig.GracefulShutdownWaitSeconds
-	log.Printf("Sig %v received, shutting down, graceful shutdown wait: %v seconds\n", sig, waitSeconds)
+	// Use aliased standard log for shutdown message
+	stdLog.Printf("Sig %v received, shutting down, graceful shutdown wait: %v seconds\n", sig, waitSeconds)
 
 	<-time.After(time.Duration(waitSeconds) * time.Second)
 

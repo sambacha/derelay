@@ -163,6 +163,15 @@ func (ws *WsServer) Run() {
 				log.Info("local message", zap.Any("client", message.client), zap.Any("message", message))
 			case Ping:
 				ws.handlePingMessage(message)
+			case Ack:
+				// Ack messages are typically handled via DApp notify channel or sent directly,
+				// receiving one on localCh might be unexpected unless specific logic added.
+				log.Warn("Received unexpected Ack message on local channel", zap.Any("message", message))
+			case Pong:
+				// Pong messages are responses to Pings, usually handled by the client, not server processing.
+				log.Warn("Received unexpected Pong message on local channel", zap.Any("message", message))
+			default:
+				log.Warn("Received unknown message type on local channel", zap.String("type", string(message.Type)), zap.Any("message", message))
 			}
 		// Receive messages from the PubSub manager goroutine
 		case msg := <-ws.remoteMessages:

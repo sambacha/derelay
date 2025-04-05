@@ -136,8 +136,11 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 
 	// Ensure stream and group exist (ignore errors if they already do) with timeout
 	ctxStreamSetup, cancelStreamSetup := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond) // Use state update timeout
-	defer cancelStreamSetup()
-	ws.redisConn.XGroupCreateMkStream(ctxStreamSetup, streamKey, groupName, "0").Result() // Ignore error
+	// Check error, but log as warning since "BUSYGROUP Consumer Group name already exists" is expected often
+	if err := ws.redisConn.XGroupCreateMkStream(ctxStreamSetup, streamKey, groupName, "0").Err(); err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+		log.Warn("Failed to create stream group (or stream)", zap.Error(err), zap.String("stream", streamKey), zap.String("group", groupName))
+	}
+	cancelStreamSetup() // Cancel context after use
 
 	pendingMessages := 0
 	processedIDs := []string{} // Keep track of IDs to ACK
