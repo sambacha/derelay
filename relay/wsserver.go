@@ -5,16 +5,20 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"time"
+
 	"github.com/RabbyHub/derelay/config"
 	"github.com/RabbyHub/derelay/log"
 	"github.com/RabbyHub/derelay/metrics"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
 type WsServer struct {
-	config *config.WsConfig
+	instanceID string // Unique ID for this server instance
+	config     *config.WsConfig
 
 	// connection maintenance
 	clients    map[*client]struct{}
@@ -49,6 +53,9 @@ func NewWSServer(config *config.Config) *WsServer {
 
 		localCh: make(chan SocketMessage, 2),
 	}
+	ws.instanceID = uuid.NewString() // Generate unique ID for this instance
+	log.Info("Initializing WsServer", zap.String("instanceID", ws.instanceID))
+
 	ws.redisConn = redis.NewClient(&redis.Options{
 		Addr:     config.RedisServerConfig.ServerAddr,
 		Password: config.RedisServerConfig.Password,
@@ -108,12 +115,39 @@ func (ws *WsServer) Run() {
 			case Ping:
 				ws.handlePingMessage(message)
 			}
-		case chmessage := <-remoteCh:
+		case chmessage, ok := <-remoteCh:
+			// Check if the channel is closed (might indicate PubSub connection issue)
+			if !ok {
+				log.Warn("Redis PubSub channel closed. Attempting to re-subscribe.")
+				// Attempt to re-establish the subscription
+				// Note: This is a basic recovery attempt. A more robust solution
+				// might involve a dedicated connection manager goroutine.
+				ws.redisSubConn = ws.redisConn.Subscribe(context.TODO()) // Re-subscribe (might block)
+				if ws.redisSubConn == nil {
+					log.Error("Failed to re-subscribe to Redis PubSub. Exiting Run loop.", nil) // Or handle differently
+					// Consider more drastic action like server restart or backoff retry
+					return // Exit loop if re-subscription fails critically
+				}
+				// Need to re-subscribe to all topics currently tracked
+				topicsToResubscribe := ws.getAllActiveTopics()
+				if len(topicsToResubscribe) > 0 {
+					err := ws.redisSubConn.Subscribe(context.TODO(), topicsToResubscribe...)
+					if err != nil {
+						log.Error("Failed to re-subscribe to topics after connection loss", err, zap.Strings("topics", topicsToResubscribe))
+						// Potentially exit or retry
+					} else {
+						log.Info("Successfully re-subscribed to topics", zap.Strings("topics", topicsToResubscribe))
+					}
+				}
+				remoteCh = ws.redisSubConn.Channel() // Get the new channel
+				continue                             // Continue to next select iteration
+			}
 
+			// Process the received message
 			message := SocketMessage{}
 			err := json.Unmarshal([]byte(chmessage.Payload), &message)
 			if err != nil {
-				log.Warn("malformed message from remote", zap.String("payload", chmessage.Payload))
+				log.Warn("malformed message from remote", zap.String("payload", chmessage.Payload), zap.Error(err))
 				continue
 			}
 			log.Info("remote message", zap.Any("message", message))
@@ -143,6 +177,28 @@ func (ws *WsServer) Run() {
 			ws.clients[client] = struct{}{}
 			metrics.SetCurrentConnections(len(ws.clients))
 
+			// Add client state tracking in Redis/DragonflyDB
+			clientKey := clientHashKey(client.id)
+			now := time.Now().Unix()
+			// Use pipeline for efficiency
+			pipe := ws.redisConn.Pipeline()
+			// Role might be unknown initially, set later in client.read heartbeat
+			pipe.HSet(context.TODO(), clientKey, map[string]interface{}{
+				"instanceID":  ws.instanceID,
+				"connectedAt": now,
+				"lastSeen":    now,
+				"role":        "", // Initialize role as empty
+			})
+			// Set a TTL for the client state hash (e.g., 24 hours)
+			// This ensures stale client state is eventually removed if heartbeats stop
+			pipe.Expire(context.TODO(), clientKey, 24*time.Hour)
+			_, err := pipe.Exec(context.TODO())
+			if err != nil {
+				log.Error("failed to set initial client state in redis", err, zap.Any("client", client))
+			} else {
+				log.Debug("set initial client state in redis", zap.Any("client", client))
+			}
+
 		case unregisterEvent := <-ws.unregister:
 			client, reason := unregisterEvent.client, unregisterEvent.reason
 
@@ -154,6 +210,47 @@ func (ws *WsServer) Run() {
 			log.Info("client disconnected", zap.Any("client", client), zap.String("reason", reason.Error()))
 		}
 	}
+}
+
+// Helper function to get all unique topics currently subscribed or published to locally
+func (ws *WsServer) getAllActiveTopics() []string {
+	activeTopics := make(map[string]struct{})
+
+	ws.subscribers.RLock()
+	for topic := range ws.subscribers.Data {
+		if len(ws.subscribers.Data[topic]) > 0 {
+			activeTopics[messageChanKey(topic)] = struct{}{}
+		}
+	}
+	ws.subscribers.RUnlock()
+
+	ws.publishers.RLock()
+	for topic := range ws.publishers.Data {
+		if len(ws.publishers.Data[topic]) > 0 {
+			// Check if messageChanKey is already added
+			if _, exists := activeTopics[messageChanKey(topic)]; !exists {
+				activeTopics[messageChanKey(topic)] = struct{}{}
+			}
+			// Add dappNotifyChanKey if any publisher is a Dapp
+			isDappPublisherPresent := false
+			for client := range ws.publishers.Data[topic] {
+				if client.role == Dapp {
+					isDappPublisherPresent = true
+					break
+				}
+			}
+			if isDappPublisherPresent {
+				activeTopics[dappNotifyChanKey(topic)] = struct{}{}
+			}
+		}
+	}
+	ws.publishers.RUnlock()
+
+	topicList := make([]string, 0, len(activeTopics))
+	for topic := range activeTopics {
+		topicList = append(topicList, topic)
+	}
+	return topicList
 }
 
 func (ws *WsServer) GetSubscriber(topic string) []*client {
@@ -176,37 +273,17 @@ func (ws *WsServer) GetDappPublisher(topic string) []*client {
 	return dapps
 }
 
-// getCachedMessages gets pending notifications from cache by topic
-// you can set `clear` to true if you want clear the pending notifications meanwhile
-func (ws *WsServer) getCachedMessages(topic string, clear bool) []SocketMessage {
-	// Retrieve the notifications from Redis by topic
-	notificationBytes, err := ws.redisConn.LRange(context.TODO(), cachedMessageKey(topic), 0, -1).Result()
-	if err != nil {
-		log.Warn("get cached messages failed", zap.String("topic", topic), zap.Error(err))
-		return nil
-	}
-
-	// Deserialize the notifications from JSON
-	notifications := make([]SocketMessage, 0, len(notificationBytes))
-	for _, nb := range notificationBytes {
-		var n SocketMessage
-		err := json.Unmarshal([]byte(nb), &n)
-		if err != nil {
-			log.Error("malformed message, unmarshal failed", nil, zap.Any("topic", topic), zap.Any("notification", nb))
-			return nil
-		}
-		notifications = append(notifications, n)
-	}
-
-	if clear && len(notifications) > 0 {
-		go func() {
-			metrics.DecCachedMessages()
-			ws.redisConn.Del(context.TODO(), cachedMessageKey(topic))
-		}()
-	}
-
-	return notifications
-}
+// getCachedMessages function is removed as caching is now handled by reading from streams in subMessage
 
 func (ws *WsServer) Shutdown() {
+	// TODO: Implement graceful shutdown logic if needed
+	// - Close redis connections?
+	// - Wait for client goroutines? (terminate signals them)
+	log.Info("WsServer shutting down", zap.String("instanceID", ws.instanceID))
+	if ws.redisSubConn != nil {
+		ws.redisSubConn.Close()
+	}
+	if ws.redisConn != nil {
+		ws.redisConn.Close()
+	}
 }
