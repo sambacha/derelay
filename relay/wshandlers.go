@@ -156,9 +156,9 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 	// Loop to read pending messages (start from 0-0 for this consumer in the group)
 	for {
 		ctxRead, cancelRead := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StreamReadTimeoutMs)*time.Millisecond)
-		var results []redis.XStream // Declare results outside assignment
-		// Use '=' to avoid shadowing outer 'err'
-		results, err = ws.redisConn.XReadGroup(ctxRead, &redis.XReadGroupArgs{ // Use ctxRead
+		var results []redis.XStream                                                // Declare results outside assignment
+		var readErr error                                                          // Explicitly declare error variable
+		results, readErr = ws.redisConn.XReadGroup(ctxRead, &redis.XReadGroupArgs{ // Use ctxRead
 			Group:    groupName,
 			Consumer: consumerName,
 			Streams:  []string{streamKey, "0-0"}, // Read pending messages (ID > 0-0)
@@ -167,10 +167,10 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 		}).Result()
 		cancelRead() // Cancel context as soon as XReadGroup returns
 
-		if err != nil {
+		if readErr != nil {
 			// If no stream exists yet, that's fine. Otherwise log error.
-			if !errors.Is(err, redis.Nil) && !strings.Contains(err.Error(), "NOGROUP") { // NOGROUP check might be needed depending on redis version/client behavior
-				log.Warn("failed to read stream group", zap.Error(err), zap.String("stream", streamKey), zap.String("group", groupName), zap.Any("client", subscriber))
+			if !errors.Is(readErr, redis.Nil) && !strings.Contains(readErr.Error(), "NOGROUP") { // NOGROUP check might be needed depending on redis version/client behavior
+				log.Warn("failed to read stream group", zap.Error(readErr), zap.String("stream", streamKey), zap.String("group", groupName), zap.Any("client", subscriber))
 			}
 			break // Exit loop on error or no messages
 		}
