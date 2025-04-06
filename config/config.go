@@ -34,7 +34,12 @@ var defaultConfig = Config{
 		AllowedOrigins:             []string{"*"},
 	},
 	RedisServerConfig: RedisConfig{
-		ServerAddr: "127.0.0.1:6379",
+		ServerAddr:           "127.0.0.1:6379",
+		HeartbeatTimeoutMs:   1000,
+		StateUpdateTimeoutMs: 2000,
+		CacheWriteTimeoutMs:  2000,
+		StreamReadTimeoutMs:  3000,
+		PublishTimeoutMs:     2000,
 	},
 	MetricServerConfig: MetricConfig{
 		Enable: true,
@@ -52,9 +57,13 @@ func LoadConfig(configPath string) Config {
 	if err != nil {
 		log.Fatalf("open config file error: %v\n", err)
 	}
-	defer configFile.Close()
+	defer func() {
+		if err := configFile.Close(); err != nil {
+			log.Printf("Error closing config file %s: %v\n", configPath, err)
+		}
+	}()
 
-	var config Config = defaultConfig
+	var config = defaultConfig
 	parser := yaml.NewDecoder(configFile)
 	err = parser.Decode(&config)
 	if err != nil {

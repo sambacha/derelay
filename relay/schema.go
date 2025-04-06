@@ -56,15 +56,26 @@ const (
 	SessionResumed   PhaseType = "sessionResumed"
 )
 
-// redis key prefix
+// redis key/stream/channel prefixes
 const (
-	// redis message cache
-	cachedMessagePrefix = "wc:relay:cache:pendingMessages:"
+	// redis message stream (replaces list cache)
+	streamMessagePrefix = "wc:relay:stream:messages:"
 
-	// redis message channels
+	// redis message channels (Pub/Sub)
 	messageChan    = "wc:relay:chan:messages:"
 	dappNotifyChan = "wc:relay:chan:dappNotify:"
+
+	// redis client state tracking
+	clientHashPrefix    = "wc:relay:client:"
+	clientSubsSetPrefix = "wc:relay:client:subs:"
+	clientPubsSetPrefix = "wc:relay:client:pubs:"
 )
+
+// Key/Stream/Channel generation functions
+
+func streamMessageKey(topic string) string {
+	return streamMessagePrefix + topic
+}
 
 func messageChanKey(topic string) string {
 	return messageChan + topic
@@ -74,13 +85,21 @@ func dappNotifyChanKey(topic string) string {
 	return dappNotifyChan + topic
 }
 
-// fromDappNotifyChan checks whether the redis notify message is from the notfyDapp channel
-func fromDappNotifyChan(channel string) bool {
-	return strings.HasPrefix(channel, dappNotifyChan)
+func clientHashKey(clientID string) string {
+	return clientHashPrefix + clientID
 }
 
-func cachedMessageKey(topic string) string {
-	return cachedMessagePrefix + topic
+func clientSubsSetKey(clientID string) string {
+	return clientSubsSetPrefix + clientID
+}
+
+func clientPubsSetKey(clientID string) string {
+	return clientPubsSetPrefix + clientID
+}
+
+// fromDappNotifyChan checks whether the redis notify message is from the notifyDapp channel
+func fromDappNotifyChan(channel string) bool {
+	return strings.HasPrefix(channel, dappNotifyChan)
 }
 
 // TopicClientSet stores topic -> clients relationship

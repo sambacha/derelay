@@ -3,42 +3,65 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"net" // Add back net for IP parsing
 	"net/http"
+	"strings" // For IP parsing
+	"sync"    // Keep only one sync import
+	"time"
 
 	"github.com/RabbyHub/derelay/config"
 	"github.com/RabbyHub/derelay/log"
 	"github.com/RabbyHub/derelay/metrics"
+	"github.com/RabbyHub/derelay/ports" // Import the new ports package
+
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate" // Import rate limiter package
 )
 
 type WsServer struct {
-	config *config.WsConfig
+	instanceID  string // Unique ID for this server instance
+	config      *config.WsConfig
+	redisConfig *config.RedisConfig // Add Redis config reference
 
 	// connection maintenance
 	clients    map[*client]struct{}
 	register   chan *client
 	unregister chan ClientUnregisterEvent
 
-	redisConn    *redis.Client
-	redisSubConn *redis.PubSub
+	redisConn ports.RedisClient // Use the interface
 
 	publishers  *TopicClientSet
 	subscribers *TopicClientSet
 
-	localCh chan SocketMessage // for handling message of local clients
+	localCh             chan SocketMessage  // for handling message of local clients
+	remoteMessages      chan *redis.Message // Messages received from PubSub manager
+	subscribeRequests   chan []string       // Channel to request subscriptions
+	unsubscribeRequests chan []string       // Channel to request unsubscriptions
+
+	ctx    context.Context    // Context for managing goroutine lifecycle
+	cancel context.CancelFunc // Func to cancel the context
+
+	clientWG sync.WaitGroup // WaitGroup for active client goroutines
+
+	// Rate Limiting
+	ipLimiters          map[string]*rate.Limiter
+	ipLimitersMutex     sync.RWMutex
+	clientLimiters      map[string]*rate.Limiter
+	clientLimitersMutex sync.RWMutex
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // TODO Only white list allowed origins
-	},
-}
+// upgrader is configured in NewWSServer now, as it needs access to config
+// var upgrader = websocket.Upgrader{ ... } // Removed global variable
 
-func NewWSServer(config *config.Config) *WsServer {
+// NewWSServer now takes the RedisClient interface and config structs directly
+func NewWSServer(wsCfg *config.WsConfig, redisCfg *config.RedisConfig, redisClient ports.RedisClient) *WsServer {
 	ws := &WsServer{
-		config: &config.WsServerConfig, // config
+		config:      wsCfg,       // Use injected config
+		redisConfig: redisCfg,    // Use injected config
+		redisConn:   redisClient, // Use injected client
 
 		clients:    make(map[*client]struct{}),
 		register:   make(chan *client, 4096),
@@ -48,21 +71,133 @@ func NewWSServer(config *config.Config) *WsServer {
 		subscribers: NewTopicClientSet(),
 
 		localCh: make(chan SocketMessage, 2),
+
+		// Initialize rate limiter maps
+		ipLimiters:     make(map[string]*rate.Limiter),
+		clientLimiters: make(map[string]*rate.Limiter),
 	}
-	ws.redisConn = redis.NewClient(&redis.Options{
-		Addr:     config.RedisServerConfig.ServerAddr,
-		Password: config.RedisServerConfig.Password,
-		DB:       0,
-	})
-	ws.redisSubConn = ws.redisConn.Subscribe(context.TODO())
+	ws.instanceID = uuid.NewString() // Generate unique ID for this instance
+	log.Info("Initializing WsServer", zap.String("instanceID", ws.instanceID))
+
+	// Redis client creation moved outside to main.go
+
+	// Initialize context and channels for the manager goroutine
+	ws.ctx, ws.cancel = context.WithCancel(context.Background())
+	ws.remoteMessages = make(chan *redis.Message, 128) // Buffered channel
+	ws.subscribeRequests = make(chan []string, 32)
+	ws.unsubscribeRequests = make(chan []string, 32)
+
+	// Start the PubSub connection manager goroutine
+	go ws.managePubSubConnection()
 
 	return ws
 }
 
+// Helper function to get or create an IP limiter
+func (ws *WsServer) getIPLimiter(ip string) *rate.Limiter {
+	ws.ipLimitersMutex.Lock()
+	defer ws.ipLimitersMutex.Unlock()
+
+	limiter, exists := ws.ipLimiters[ip]
+	if !exists {
+		// Use configured rate and burst, ensure non-zero defaults if config loading fails
+		rateLimit := rate.Limit(ws.config.ConnectionLimitPerIP)
+		burst := ws.config.ConnectionBurstPerIP
+		if rateLimit <= 0 {
+			rateLimit = 10 // Default rate
+		}
+		if burst <= 0 {
+			burst = 20 // Default burst
+		}
+		limiter = rate.NewLimiter(rateLimit, burst)
+		ws.ipLimiters[ip] = limiter
+		log.Debug("Created new IP rate limiter", zap.String("ip", ip), zap.Float64("rate", float64(rateLimit)), zap.Int("burst", burst))
+	}
+	return limiter
+}
+
+// Helper function to get or create a client message limiter
+func (ws *WsServer) getClientLimiter(clientID string) *rate.Limiter {
+	ws.clientLimitersMutex.Lock()
+	defer ws.clientLimitersMutex.Unlock()
+
+	limiter, exists := ws.clientLimiters[clientID]
+	if !exists {
+		// Use configured rate and burst
+		rateLimit := rate.Limit(ws.config.MessageLimitPerClient)
+		burst := ws.config.MessageBurstPerClient
+		if rateLimit <= 0 {
+			rateLimit = 50 // Default rate
+		}
+		if burst <= 0 {
+			burst = 100 // Default burst
+		}
+		limiter = rate.NewLimiter(rateLimit, burst)
+		ws.clientLimiters[clientID] = limiter
+		log.Debug("Created new client message rate limiter", zap.String("clientID", clientID), zap.Float64("rate", float64(rateLimit)), zap.Int("burst", burst))
+	}
+	return limiter
+}
+
 func (ws *WsServer) NewClientConn(w http.ResponseWriter, r *http.Request) {
+	// --- Connection Rate Limiting ---
+	if ws.config.EnableConnectionRateLimit {
+		// Extract IP address (handle potential errors and proxies)
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			// Fallback or try X-Forwarded-For etc. if behind proxy
+			forwarded := r.Header.Get("X-Forwarded-For")
+			if forwarded != "" {
+				parts := strings.Split(forwarded, ",")
+				ip = strings.TrimSpace(parts[0]) // Use the first IP in the list
+			} else {
+				log.Warn("Could not parse remote IP for rate limiting", zap.String("remoteAddr", r.RemoteAddr), zap.Error(err))
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// Get limiter and check allowance
+		limiter := ws.getIPLimiter(ip)
+		if !limiter.Allow() {
+			log.Warn("Connection rate limit exceeded for IP", zap.String("ip", ip))
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return // Reject connection
+		}
+		log.Debug("Connection rate limit check passed", zap.String("ip", ip))
+	}
+	// --- End Connection Rate Limiting ---
+
+	// Configure upgrader dynamically based on ws.config
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			// If AllowedOrigins is empty or nil, allow all origins
+			if len(ws.config.AllowedOrigins) == 0 {
+				return true
+			}
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				// Allow requests with no Origin header? Or deny? Denying is safer.
+				return false
+			}
+			for _, allowed := range ws.config.AllowedOrigins {
+				// Current logic: exact match or wildcard "*"
+				if allowed == "*" || allowed == origin {
+					return true
+				}
+			}
+			log.Warn("WebSocket origin denied", zap.String("origin", origin), zap.Strings("allowed", ws.config.AllowedOrigins))
+			return false
+		},
+		// Add other upgrader options if needed (ReadBufferSize, WriteBufferSize)
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		// ignore the clients who ain't mean to do websocket communication with us
+		// Log upgrade errors for debugging, but don't flood logs for non-websocket requests
+		// Check for specific websocket handshake errors if possible
+		log.Debug("WebSocket upgrade failed", zap.Error(err), zap.String("remoteAddr", r.RemoteAddr), zap.String("origin", r.Header.Get("Origin")))
+		// Return directly without sending an HTTP error response, as Upgrade handles that.
 		return
 	}
 
@@ -78,17 +213,23 @@ func (ws *WsServer) NewClientConn(w http.ResponseWriter, r *http.Request) {
 
 	ws.register <- client
 
+	// Add client to WaitGroup before starting goroutines
+	ws.clientWG.Add(1)
 	go client.read()
 	go client.write()
 }
 
 func (ws *WsServer) Run() {
-	log.Info("Websocket server has been started")
-
-	remoteCh := ws.redisSubConn.Channel()
+	log.Info("Websocket server Run loop started")
+	// remoteCh := ws.redisSubConn.Channel() // Removed: Using ws.remoteMessages now
 
 	for {
 		select {
+		// Handle shutdown signal
+		case <-ws.ctx.Done():
+			log.Info("WsServer Run loop stopping due to context cancellation.")
+			return
+
 		case message := <-ws.localCh:
 			// local message could be "pub", "sub" or "ack" or "ping"
 			// pub/sub message handler may contain time-consuming operations(e.g. read/write redis)
@@ -108,21 +249,24 @@ func (ws *WsServer) Run() {
 			case Ping:
 				ws.handlePingMessage(message)
 			}
-		case chmessage := <-remoteCh:
+		// Receive messages from the PubSub manager goroutine
+		case msg := <-ws.remoteMessages:
+			// Reconnection logic is now handled by managePubSubConnection goroutine
 
+			// Process the received message
 			message := SocketMessage{}
-			err := json.Unmarshal([]byte(chmessage.Payload), &message)
+			err := json.Unmarshal([]byte(msg.Payload), &message) // Use msg.Payload
 			if err != nil {
-				log.Warn("malformed message from remote", zap.String("payload", chmessage.Payload))
+				log.Warn("malformed message from remote", zap.String("payload", msg.Payload), zap.Error(err))
 				continue
 			}
-			log.Info("remote message", zap.Any("message", message))
+			log.Debug("remote message received", zap.Any("message", message), zap.String("channel", msg.Channel)) // Log channel too
 
 			// if message is not from `dappNotifyChan`, then must be from `messageChan` and must be a "pub" message
-			if !fromDappNotifyChan(chmessage.Channel) {
+			if !fromDappNotifyChan(msg.Channel) { // Check msg.Channel
 				for _, subscriber := range ws.GetSubscriber(message.Topic) {
-					log.Info("forward to subscriber", zap.Any("client", subscriber), zap.Any("message", message))
-					subscriber.send(message)
+					log.Debug("forwarding remote pub to subscriber", zap.Any("client", subscriber), zap.Any("message", message))
+					subscriber.send(message) // Forward the unmarshaled SocketMessage
 				}
 				continue
 			}
@@ -143,17 +287,92 @@ func (ws *WsServer) Run() {
 			ws.clients[client] = struct{}{}
 			metrics.SetCurrentConnections(len(ws.clients))
 
+			// Add client state tracking in Redis/DragonflyDB
+			clientKey := clientHashKey(client.id)
+			now := time.Now().Unix()
+			// Use pipeline for efficiency
+			pipe := ws.redisConn.Pipeline()
+			// Role might be unknown initially, set later in client.read heartbeat
+			pipe.HSet(context.TODO(), clientKey, map[string]interface{}{
+				"instanceID":  ws.instanceID,
+				"connectedAt": now,
+				"lastSeen":    now,
+				"role":        "", // Initialize role as empty
+			})
+			// Set a TTL for the client state hash (e.g., 24 hours)
+			// This ensures stale client state is eventually removed if heartbeats stop
+			pipe.Expire(context.TODO(), clientKey, 24*time.Hour)
+			_, err := pipe.Exec(context.TODO())
+			if err != nil {
+				log.Error("failed to set initial client state in redis", err, zap.Any("client", client))
+			} else {
+				log.Debug("set initial client state in redis", zap.Any("client", client))
+			}
+
 		case unregisterEvent := <-ws.unregister:
 			client, reason := unregisterEvent.client, unregisterEvent.reason
 
 			ws.handleClientDisconnect(client)
 			delete(ws.clients, client)
 
+			// --- Rate Limiter Cleanup ---
+			// Remove client message limiter
+			ws.clientLimitersMutex.Lock()
+			delete(ws.clientLimiters, client.id)
+			ws.clientLimitersMutex.Unlock()
+			log.Debug("Removed client message rate limiter", zap.Any("client", client))
+			// Note: IP limiter cleanup needs a separate strategy (e.g., periodic task)
+			// --- End Rate Limiter Cleanup ---
+
 			metrics.IncClosedConnection()
 			metrics.SetCurrentConnections(len(ws.clients))
 			log.Info("client disconnected", zap.Any("client", client), zap.String("reason", reason.Error()))
+
+			// Decrement WaitGroup after handling unregistration
+			ws.clientWG.Done()
 		}
 	}
+}
+
+// Helper function to get all unique topics currently subscribed or published to locally
+func (ws *WsServer) getAllActiveTopics() []string {
+	activeTopics := make(map[string]struct{})
+
+	ws.subscribers.RLock()
+	for topic := range ws.subscribers.Data {
+		if len(ws.subscribers.Data[topic]) > 0 {
+			activeTopics[messageChanKey(topic)] = struct{}{}
+		}
+	}
+	ws.subscribers.RUnlock()
+
+	ws.publishers.RLock()
+	for topic := range ws.publishers.Data {
+		if len(ws.publishers.Data[topic]) > 0 {
+			// Check if messageChanKey is already added
+			if _, exists := activeTopics[messageChanKey(topic)]; !exists {
+				activeTopics[messageChanKey(topic)] = struct{}{}
+			}
+			// Add dappNotifyChanKey if any publisher is a Dapp
+			isDappPublisherPresent := false
+			for client := range ws.publishers.Data[topic] {
+				if client.role == Dapp {
+					isDappPublisherPresent = true
+					break
+				}
+			}
+			if isDappPublisherPresent {
+				activeTopics[dappNotifyChanKey(topic)] = struct{}{}
+			}
+		}
+	}
+	ws.publishers.RUnlock()
+
+	topicList := make([]string, 0, len(activeTopics))
+	for topic := range activeTopics {
+		topicList = append(topicList, topic)
+	}
+	return topicList
 }
 
 func (ws *WsServer) GetSubscriber(topic string) []*client {
@@ -176,37 +395,168 @@ func (ws *WsServer) GetDappPublisher(topic string) []*client {
 	return dapps
 }
 
-// getCachedMessages gets pending notifications from cache by topic
-// you can set `clear` to true if you want clear the pending notifications meanwhile
-func (ws *WsServer) getCachedMessages(topic string, clear bool) []SocketMessage {
-	// Retrieve the notifications from Redis by topic
-	notificationBytes, err := ws.redisConn.LRange(context.TODO(), cachedMessageKey(topic), 0, -1).Result()
-	if err != nil {
-		log.Warn("get cached messages failed", zap.String("topic", topic), zap.Error(err))
-		return nil
-	}
-
-	// Deserialize the notifications from JSON
-	notifications := make([]SocketMessage, 0, len(notificationBytes))
-	for _, nb := range notificationBytes {
-		var n SocketMessage
-		err := json.Unmarshal([]byte(nb), &n)
-		if err != nil {
-			log.Error("malformed message, unmarshal failed", nil, zap.Any("topic", topic), zap.Any("notification", nb))
-			return nil
-		}
-		notifications = append(notifications, n)
-	}
-
-	if clear && len(notifications) > 0 {
-		go func() {
-			metrics.DecCachedMessages()
-			ws.redisConn.Del(context.TODO(), cachedMessageKey(topic))
-		}()
-	}
-
-	return notifications
-}
+// getCachedMessages function is removed as caching is now handled by reading from streams in subMessage
 
 func (ws *WsServer) Shutdown() {
+	// Graceful shutdown logic: Signal the manager goroutine to stop and close connections.
+	log.Info("WsServer shutting down", zap.String("instanceID", ws.instanceID))
+
+	// Signal the PubSub manager goroutine to stop
+	if ws.cancel != nil {
+		ws.cancel()
+	}
+
+	// Close the main Redis connection
+	if ws.redisConn != nil {
+		if err := ws.redisConn.Close(); err != nil {
+			log.Error("Error closing main redis connection", err) // Correct signature
+		}
+	}
+	// The managePubSubConnection goroutine is responsible for closing its own redisSubConn
+
+	// Wait for all client goroutines to finish
+	log.Info("Waiting for client goroutines to shut down...")
+	ws.clientWG.Wait()
+	log.Info("All client goroutines shut down.")
+}
+
+// managePubSubConnection runs in a background goroutine to handle the Redis PubSub connection.
+func (ws *WsServer) managePubSubConnection() {
+	defer log.Info("PubSub connection manager stopped.")
+	log.Info("PubSub connection manager started.")
+
+	var currentSubConn *redis.PubSub
+	var msgCh <-chan *redis.Message
+	backoff := time.Second // Initial backoff duration
+
+	for {
+		select {
+		case <-ws.ctx.Done(): // Check for shutdown signal first
+			if currentSubConn != nil {
+				if err := currentSubConn.Close(); err != nil {
+					log.Error("Error closing pubsub connection on shutdown", err) // Correct signature
+				}
+			}
+			return
+		default:
+			// Attempt to establish connection if not currently connected
+			if currentSubConn == nil {
+				log.Info("Attempting to establish PubSub connection...")
+				subConn := ws.redisConn.Subscribe(ws.ctx) // Use ws.ctx
+				if subConn == nil {                       // Check if Subscribe itself failed immediately
+					log.Error("Failed to initiate PubSub subscription.", nil)
+					// Wait before retrying
+					time.Sleep(backoff)
+					backoff = min(backoff*2, 30*time.Second) // Exponential backoff up to 30s
+					continue
+				}
+
+				// Verify connection by trying to receive confirmation (optional but good practice)
+				_, err := subConn.Receive(ws.ctx)
+				if err != nil {
+					log.Error("Failed to verify PubSub subscription.", err)
+					subConn.Close()
+					time.Sleep(backoff)
+					backoff = min(backoff*2, 30*time.Second)
+					continue
+				}
+
+				log.Info("PubSub connection established.")
+				currentSubConn = subConn
+				msgCh = currentSubConn.Channel()
+				backoff = time.Second // Reset backoff on successful connection
+
+				// Re-subscribe to all necessary topics
+				topicsToResubscribe := ws.getAllActiveTopics()
+				if len(topicsToResubscribe) > 0 {
+					log.Info("Re-subscribing to active topics", zap.Strings("topics", topicsToResubscribe))
+					err := currentSubConn.Subscribe(ws.ctx, topicsToResubscribe...)
+					if err != nil {
+						log.Error("Failed to re-subscribe to topics after connection.", err)
+						// Connection might be unhealthy, close and retry
+						currentSubConn.Close()
+						currentSubConn = nil
+						msgCh = nil
+						continue // Retry connection
+					}
+				}
+			}
+
+			// Inner select loop for active connection
+			select {
+			case <-ws.ctx.Done():
+				if currentSubConn != nil {
+					currentSubConn.Close()
+				}
+				return
+
+			case msg, ok := <-msgCh:
+				if !ok {
+					log.Warn("PubSub message channel closed. Connection lost.")
+					if err := currentSubConn.Close(); err != nil { // Ensure closed
+						log.Error("Error closing pubsub connection after channel close", err) // Correct signature
+					}
+					currentSubConn = nil
+					msgCh = nil
+					// No sleep here, outer loop will handle backoff retry
+				} else {
+					// Forward message to main Run loop
+					select {
+					case ws.remoteMessages <- msg:
+					// Message forwarded
+					case <-ws.ctx.Done():
+						// Shutdown during forward attempt
+						if currentSubConn != nil {
+							currentSubConn.Close()
+						}
+						return
+					}
+				}
+
+			case topics := <-ws.subscribeRequests:
+				if currentSubConn != nil {
+					log.Debug("Processing subscribe request", zap.Strings("topics", topics))
+					err := currentSubConn.Subscribe(ws.ctx, topics...)
+					if err != nil {
+						log.Error("Failed to subscribe to topics", err, zap.Strings("topics", topics)) // Correct signature
+						// Assume connection is broken, trigger reconnect
+						if errClose := currentSubConn.Close(); errClose != nil {
+							log.Error("Error closing pubsub connection after failed subscribe", errClose) // Correct signature
+						}
+						currentSubConn = nil
+						msgCh = nil
+					}
+				} else {
+					log.Warn("Received subscribe request while PubSub disconnected.", zap.Strings("topics", topics))
+					// Topics will be subscribed on next successful connection
+				}
+
+			case topics := <-ws.unsubscribeRequests:
+				if currentSubConn != nil {
+					log.Debug("Processing unsubscribe request", zap.Strings("topics", topics))
+					err := currentSubConn.Unsubscribe(ws.ctx, topics...)
+					if err != nil {
+						log.Error("Failed to unsubscribe from topics", err, zap.Strings("topics", topics)) // Correct signature
+						// Assume connection is broken, trigger reconnect
+						if errClose := currentSubConn.Close(); errClose != nil {
+							log.Error("Error closing pubsub connection after failed unsubscribe", errClose) // Correct signature
+						}
+						currentSubConn = nil
+						msgCh = nil
+					}
+				} else {
+					log.Warn("Received unsubscribe request while PubSub disconnected.", zap.Strings("topics", topics))
+					// No action needed if disconnected
+				}
+			}
+		}
+	}
+}
+
+// min helper for backoff calculation
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
