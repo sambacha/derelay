@@ -3,18 +3,22 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"net" // Add back net for IP parsing
 	"net/http"
-	"sync" // Add sync import
+	"strings" // For IP parsing
+	"sync"    // Keep only one sync import
 	"time"
 
 	"github.com/RabbyHub/derelay/config"
 	"github.com/RabbyHub/derelay/log"
 	"github.com/RabbyHub/derelay/metrics"
 	"github.com/RabbyHub/derelay/ports" // Import the new ports package
+
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket" // Re-add import
-	"github.com/redis/go-redis/v9" // Keep for PubSub concrete type
+	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate" // Import rate limiter package
 )
 
 type WsServer struct {
@@ -41,6 +45,12 @@ type WsServer struct {
 	cancel context.CancelFunc // Func to cancel the context
 
 	clientWG sync.WaitGroup // WaitGroup for active client goroutines
+
+	// Rate Limiting
+	ipLimiters          map[string]*rate.Limiter
+	ipLimitersMutex     sync.RWMutex
+	clientLimiters      map[string]*rate.Limiter
+	clientLimitersMutex sync.RWMutex
 }
 
 // upgrader is configured in NewWSServer now, as it needs access to config
@@ -61,6 +71,10 @@ func NewWSServer(wsCfg *config.WsConfig, redisCfg *config.RedisConfig, redisClie
 		subscribers: NewTopicClientSet(),
 
 		localCh: make(chan SocketMessage, 2),
+
+		// Initialize rate limiter maps
+		ipLimiters:     make(map[string]*rate.Limiter),
+		clientLimiters: make(map[string]*rate.Limiter),
 	}
 	ws.instanceID = uuid.NewString() // Generate unique ID for this instance
 	log.Info("Initializing WsServer", zap.String("instanceID", ws.instanceID))
@@ -79,7 +93,81 @@ func NewWSServer(wsCfg *config.WsConfig, redisCfg *config.RedisConfig, redisClie
 	return ws
 }
 
+// Helper function to get or create an IP limiter
+func (ws *WsServer) getIPLimiter(ip string) *rate.Limiter {
+	ws.ipLimitersMutex.Lock()
+	defer ws.ipLimitersMutex.Unlock()
+
+	limiter, exists := ws.ipLimiters[ip]
+	if !exists {
+		// Use configured rate and burst, ensure non-zero defaults if config loading fails
+		rateLimit := rate.Limit(ws.config.ConnectionLimitPerIP)
+		burst := ws.config.ConnectionBurstPerIP
+		if rateLimit <= 0 {
+			rateLimit = 10 // Default rate
+		}
+		if burst <= 0 {
+			burst = 20 // Default burst
+		}
+		limiter = rate.NewLimiter(rateLimit, burst)
+		ws.ipLimiters[ip] = limiter
+		log.Debug("Created new IP rate limiter", zap.String("ip", ip), zap.Float64("rate", float64(rateLimit)), zap.Int("burst", burst))
+	}
+	return limiter
+}
+
+// Helper function to get or create a client message limiter
+func (ws *WsServer) getClientLimiter(clientID string) *rate.Limiter {
+	ws.clientLimitersMutex.Lock()
+	defer ws.clientLimitersMutex.Unlock()
+
+	limiter, exists := ws.clientLimiters[clientID]
+	if !exists {
+		// Use configured rate and burst
+		rateLimit := rate.Limit(ws.config.MessageLimitPerClient)
+		burst := ws.config.MessageBurstPerClient
+		if rateLimit <= 0 {
+			rateLimit = 50 // Default rate
+		}
+		if burst <= 0 {
+			burst = 100 // Default burst
+		}
+		limiter = rate.NewLimiter(rateLimit, burst)
+		ws.clientLimiters[clientID] = limiter
+		log.Debug("Created new client message rate limiter", zap.String("clientID", clientID), zap.Float64("rate", float64(rateLimit)), zap.Int("burst", burst))
+	}
+	return limiter
+}
+
 func (ws *WsServer) NewClientConn(w http.ResponseWriter, r *http.Request) {
+	// --- Connection Rate Limiting ---
+	if ws.config.EnableConnectionRateLimit {
+		// Extract IP address (handle potential errors and proxies)
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			// Fallback or try X-Forwarded-For etc. if behind proxy
+			forwarded := r.Header.Get("X-Forwarded-For")
+			if forwarded != "" {
+				parts := strings.Split(forwarded, ",")
+				ip = strings.TrimSpace(parts[0]) // Use the first IP in the list
+			} else {
+				log.Warn("Could not parse remote IP for rate limiting", zap.String("remoteAddr", r.RemoteAddr), zap.Error(err))
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// Get limiter and check allowance
+		limiter := ws.getIPLimiter(ip)
+		if !limiter.Allow() {
+			log.Warn("Connection rate limit exceeded for IP", zap.String("ip", ip))
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return // Reject connection
+		}
+		log.Debug("Connection rate limit check passed", zap.String("ip", ip))
+	}
+	// --- End Connection Rate Limiting ---
+
 	// Configure upgrader dynamically based on ws.config
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
@@ -226,6 +314,15 @@ func (ws *WsServer) Run() {
 
 			ws.handleClientDisconnect(client)
 			delete(ws.clients, client)
+
+			// --- Rate Limiter Cleanup ---
+			// Remove client message limiter
+			ws.clientLimitersMutex.Lock()
+			delete(ws.clientLimiters, client.id)
+			ws.clientLimitersMutex.Unlock()
+			log.Debug("Removed client message rate limiter", zap.Any("client", client))
+			// Note: IP limiter cleanup needs a separate strategy (e.g., periodic task)
+			// --- End Rate Limiter Cleanup ---
 
 			metrics.IncClosedConnection()
 			metrics.SetCurrentConnections(len(ws.clients))

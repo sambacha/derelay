@@ -13,10 +13,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// ApproxMaxStreamLen defines the approximate maximum length for message streams.
-// Needs to be configurable or derived from cache time / expected rate.
-const ApproxMaxStreamLen = 10000
-
 // WsMessageHandler func(*WsServer, SocketMessage) // This type seems unused, can be removed if confirmed.
 
 func (ws *WsServer) pubMessage(message SocketMessage) {
@@ -78,14 +74,26 @@ func (ws *WsServer) pubMessage(message SocketMessage) {
 			defer cancelCache()
 			_, err = ws.redisConn.XAdd(ctxCache, &redis.XAddArgs{ // Use ctxCache
 				Stream: streamKey,
-				MaxLen: ApproxMaxStreamLen, // Trim stream approximately
-				Approx: true,
+				MaxLen: ws.redisConfig.StreamMaxLength, // Use configured max length
+				Approx: true,                           // Keep Approx for performance
 				Values: map[string]interface{}{"message": string(msgBytes)},
 			}).Result()
 			if err != nil {
 				log.Warn("failed to cache message to stream", zap.Error(err), zap.Any("message", message))
 			} else {
 				log.Debug("message cached to stream", zap.Any("client", publisher), zap.Any("topic", topic))
+			}
+			// Set/Update TTL on the stream after adding a message
+			if ws.redisConfig.StreamTTLSeconds > 0 {
+				ttlDuration := time.Duration(ws.redisConfig.StreamTTLSeconds) * time.Second
+				// Re-use the ctxCache context or create a new short-lived one
+				_, err := ws.redisConn.Expire(ctxCache, streamKey, ttlDuration).Result()
+				if err != nil {
+					// Log as warning, main operation (XAdd) might have succeeded
+					log.Warn("failed to set TTL on stream cache after XADD", zap.Error(err), zap.String("stream", streamKey))
+				} else {
+					log.Debug("set TTL on stream cache", zap.String("stream", streamKey), zap.Duration("ttl", ttlDuration))
+				}
 			}
 		}
 	}
@@ -131,13 +139,26 @@ func (ws *WsServer) subMessage(message SocketMessage) {
 
 	// Read pending messages from stream for this client
 	streamKey := streamMessageKey(topic)
-	groupName := "derelay-cg"     // Consider making group name configurable or more dynamic if needed
-	consumerName := subscriber.id // Use client ID as consumer name
+	groupName := ws.redisConfig.StreamConsumerGroup // Use configured group name
+	consumerName := subscriber.id                   // Use client ID as consumer name
 
 	// Ensure stream and group exist (ignore errors if they already do) with timeout
 	ctxStreamSetup, cancelStreamSetup := context.WithTimeout(ws.ctx, time.Duration(ws.redisConfig.StateUpdateTimeoutMs)*time.Millisecond) // Use state update timeout
 	defer cancelStreamSetup()
+	// Use groupName variable which now holds the configured name
 	_, _ = ws.redisConn.XGroupCreateMkStream(ctxStreamSetup, streamKey, groupName, "0").Result() // Explicitly ignore error
+
+	// Set/Update TTL on the stream when a client subscribes (ensures TTL on creation)
+	if ws.redisConfig.StreamTTLSeconds > 0 {
+		ttlDuration := time.Duration(ws.redisConfig.StreamTTLSeconds) * time.Second
+		// Use the ctxStreamSetup context
+		_, err := ws.redisConn.Expire(ctxStreamSetup, streamKey, ttlDuration).Result()
+		if err != nil {
+			log.Warn("failed to set TTL on stream during subscribe/group creation", zap.Error(err), zap.String("stream", streamKey))
+		} else {
+			log.Debug("set TTL on stream during subscribe/group creation", zap.String("stream", streamKey), zap.Duration("ttl", ttlDuration))
+		}
+	}
 
 	pendingMessages := 0
 	processedIDs := []string{} // Keep track of IDs to ACK
@@ -335,9 +356,20 @@ func (ws *WsServer) handleClientDisconnect(client *client) {
 	pipe.Del(ctxState, clientHashKey(client.id))
 	pipe.Del(ctxState, clientSubsSetKey(client.id))
 	pipe.Del(ctxState, clientPubsSetKey(client.id))
+	// Remove client as a consumer from relevant stream groups
+	groupName := ws.redisConfig.StreamConsumerGroup // Use configured group name
+	consumerName := client.id
+	for topic := range subscribedTopicsMap { // Use the map captured at the start of the function
+		streamKey := streamMessageKey(topic)
+		log.Debug("Adding XGroupDelConsumer to pipeline", zap.String("stream", streamKey), zap.String("group", groupName), zap.String("consumer", consumerName))
+		// Add the command to the pipeline. Errors (like group/stream/consumer not existing)
+		// will be handled by the pipeline's Exec error check below.
+		// These specific errors are often okay, as the goal is just removal if present.
+		pipe.XGroupDelConsumer(ctxState, streamKey, groupName, consumerName)
+	}
 	_, err := pipe.Exec(ctxState) // Use ctxState
 	if err != nil {
-		log.Error("failed to cleanup client state in redis", err, zap.Any("client", client))
+		log.Error("failed to cleanup client state and consumers in redis", err, zap.Any("client", client)) // Updated log message
 	} else {
 		log.Debug("cleaned up client state in redis", zap.Any("client", client))
 	}

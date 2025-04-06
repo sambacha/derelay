@@ -73,6 +73,17 @@ func (c *client) read() {
 			continue // Skip malformed message
 		}
 
+		// --- Message Rate Limiting Check ---
+		if c.ws.config.EnableMessageRateLimit {
+			limiter := c.ws.getClientLimiter(c.id) // Use helper from WsServer
+			if !limiter.Allow() {
+				log.Warn("Message rate limit exceeded for client, dropping message", zap.Any("client", c))
+				// Optionally, could terminate the client after repeated offenses
+				continue // Drop the message
+			}
+		}
+		// --- End Message Rate Limiting Check ---
+
 		// Determine/update client role based on message
 		// Only update if role is not yet set or changes (unlikely but possible)
 		newRole := RoleType(strings.ToLower(message.Role))
